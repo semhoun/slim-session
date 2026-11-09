@@ -4,6 +4,7 @@ namespace Semhoun\SlimSession;
 
 use Psr\Clock\ClockInterface;
 use Semhoun\SlimSession\Data\JsonData;
+use Semhoun\SlimSession\Exception\InvalidSessionDataException;
 use Semhoun\SlimSession\Exception\InvalidSessionStateException;
 use Semhoun\SlimSession\Exception\StorageUnavailableException;
 use Semhoun\SlimSession\Exception\WriteConflictException;
@@ -56,13 +57,13 @@ final class SessionContext
         if ($this->state !== SessionState::Absent) {
             throw new InvalidSessionStateException('Only an absent context can create a session.');
         }
-        $this->json->validate($data, []);
+        $data = $this->assignData([], $data, []);
         for ($attempt = 0; $attempt < 5; ++$attempt) {
             $id = SessionId::generate($this->random);
             $lease = $this->store->acquire($this->config->namespace, $id, $this->secret(), $this->config->leaseMilliseconds, $this->config->acquisitionTimeoutMilliseconds);
             try {
                 $now = $this->clock->now()->getTimestamp();
-                $record = new SessionRecord($id, 0, $this->json->copy($data), [], $now, $now, $now + min($this->config->idleLifetime, $this->config->absoluteLifetime), $now + $this->config->absoluteLifetime, $this->secret(), $this->secret());
+                $record = new SessionRecord($id, 0, $data, [], $now, $now, $now + min($this->config->idleLifetime, $this->config->absoluteLifetime), $now + $this->config->absoluteLifetime, $this->secret(), $this->secret());
                 if ($this->store->create($this->config->namespace, $record, $lease)) {
                     $this->record = $record;
                     $this->lease = $lease;
@@ -83,20 +84,48 @@ final class SessionContext
         throw new WriteConflictException('Unable to allocate a session.');
     }
 
-    public function has(string $key): bool { $this->open(); return array_key_exists($key, $this->data); }
-    public function get(string $key, mixed $default = null): mixed { $this->open(); return array_key_exists($key, $this->data) ? $this->data[$key] : $default; }
+    public function has(string $key): bool
+    {
+        $this->open();
+        $value = $this->data;
+        foreach ($this->path($key) as $segment) {
+            if (!is_array($value) || !array_key_exists($segment, $value)) { return false; }
+            $value = $value[$segment];
+        }
+        return true;
+    }
+
+    public function get(string $key, mixed $default = null): mixed
+    {
+        $this->open();
+        $value = $this->data;
+        foreach ($this->path($key) as $segment) {
+            if (!is_array($value) || !array_key_exists($segment, $value)) { return $default; }
+            $value = $value[$segment];
+        }
+        return $value;
+    }
     public function set(string $key, mixed $value): void { $this->assign([$key => $value]); }
 
     /** @param array<string, mixed> $values */
     public function assign(array $values): void
     {
         $this->open();
-        $data = array_replace($this->data, $values);
-        $this->json->validate($data, $this->flash);
-        $this->data = $this->json->copy($data);
+        $this->data = $this->assignData($this->data, $values, $this->flash);
     }
 
-    public function delete(string $key): void { $this->open(); unset($this->data[$key]); }
+    public function delete(string $key): void
+    {
+        $this->open();
+        $segments = $this->path($key);
+        $leaf = array_pop($segments);
+        $parent = &$this->data;
+        foreach ($segments as $segment) {
+            if (!array_key_exists($segment, $parent) || !is_array($parent[$segment])) { return; }
+            $parent = &$parent[$segment];
+        }
+        unset($parent[$leaf]);
+    }
     public function clear(): void { $this->open(); $this->data = []; $this->flash = []; }
 
     public function flash(string $key, mixed $value): void
@@ -231,6 +260,50 @@ final class SessionContext
         if ($this->state !== SessionState::Open) {
             throw new InvalidSessionStateException('Session is not open.');
         }
+    }
+
+    /** @return non-empty-list<string> */
+    private function path(string $key): array
+    {
+        $segments = explode('.', $key);
+        if (in_array('', $segments, true)) {
+            throw new InvalidSessionDataException('Session paths must contain non-empty segments.');
+        }
+        return $segments;
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     * @param array<string, mixed> $values
+     * @param array<string, mixed> $flash
+     * @return array<string, mixed>
+     */
+    private function assignData(array $data, array $values, array $flash): array
+    {
+        $inputJson = new JsonData(PHP_INT_MAX, $this->config->maxDataDepth);
+        foreach ($values as $key => $value) {
+            $segments = $this->path((string) $key);
+            if (count($segments) > $this->config->maxDataDepth) {
+                throw new InvalidSessionDataException('Session data exceeds the depth limit.');
+            }
+            // Detach references now; enforce byte limits on the normalized result only.
+            $inputJson->validate([$key => $value], []);
+            $value = $inputJson->copy([$key => $value])[$key];
+            $leaf = array_pop($segments);
+            $parent = &$data;
+            foreach ($segments as $segment) {
+                if (!array_key_exists($segment, $parent)) {
+                    $parent[$segment] = [];
+                } elseif (!is_array($parent[$segment])) {
+                    throw new InvalidSessionDataException('Cannot write through a non-array session parent.');
+                }
+                $parent = &$parent[$segment];
+            }
+            $parent[$leaf] = $value;
+            unset($parent);
+        }
+        $this->json->validate($data, $flash);
+        return $this->json->copy($data);
     }
 
     private function lease(): Lease

@@ -58,6 +58,64 @@ application-object deserialization form part of the session contract.
 Backend codecs impose an additional 16 MiB/60-level hard ceiling. Keep configured
 limits within that ceiling; the default 64 KiB/32-level limits are smaller.
 
+### Application Data Paths
+
+`get`, `has`, `set`, and `delete` interpret dots as path separators at any depth.
+The top-level input keys of `assign` and `create` use the same rules, including
+`SessionManager::create`. Values are stored as actual nested arrays:
+
+```php
+$session = $manager->create(['user.firstname' => 'Ada']);
+$session->set('user.lastname', 'Lovelace');
+$session->get('user'); // ['firstname' => 'Ada', 'lastname' => 'Lovelace']
+$session->get('user.firstname'); // 'Ada'
+$session->set('users.0.firstname', 'Grace');
+```
+
+Paths must contain non-empty segments. Empty paths, leading or trailing dots,
+and consecutive dots throw `InvalidSessionDataException`. There is no escaping,
+literal-key precedence, wildcard, or append syntax. Numeric segments use native
+PHP array-key conversion: `0` becomes an integer key, while `01` stays a string.
+Keys inside supplied array values remain literal; for example,
+`set('settings', ['literal.dot' => true])` does not expand `literal.dot`.
+
+Writes create missing intermediate arrays, but reject traversal through an
+existing non-array parent, including null. Assigning a leaf replaces its entire
+previous value or subtree; arrays are not deep-merged. To replace a scalar parent
+with nested data, explicitly remove it first:
+
+```php
+$session->set('user', 'previous scalar');
+$session->delete('user');
+$session->set('user.firstname', 'Ada');
+```
+
+Bulk entries are applied in PHP iteration order. A later parent replaces earlier
+descendants; a later child extends an array parent but fails on a scalar parent.
+`assign(['user.name' => 'Ada', 'user' => null])` leaves `user` null, while the
+reverse order fails. Bulk writes are atomic: invalid paths, collisions, invalid
+JSON values, or configured depth/byte limits leave session data unchanged.
+Incoming PHP references are detached before overlapping writes can modify them.
+Creation normalizes and validates data before acquiring a lease or storing a record.
+
+`get` returns its default and `has` returns false for missing or scalar-blocked
+paths. A null leaf is present: `has` returns true and `get` returns null instead
+of its default. `delete('user.firstname')` removes only that child, retaining an
+empty parent array if necessary. `delete('user')` removes the entire subtree.
+Missing or scalar-blocked deletions are no-ops; numeric keys are not reindexed.
+
+Flash keys remain literal, including dots and empty strings. `clear`, lifecycle
+restrictions, JSON limits, and persistence guarantees are unchanged.
+
+**Compatibility change:** dotted keys formerly addressed literal keys; empty
+application-data keys are now invalid. Existing nested-array records remain valid,
+but stored literal dotted keys are neither reinterpreted nor used as a fallback.
+Applications with historical literal dotted keys must transform their data or
+invalidate affected sessions before adopting this behavior. No compatibility
+layer or automatic migration is provided.
+
+### Record Snapshots
+
 An immutable `SessionRecord` includes schema version, revision, data, flash,
 creation/activity times, idle/absolute deadlines, a CSRF proof, and a required
 independent `verificationSecret`. Its constructor places `verificationSecret`

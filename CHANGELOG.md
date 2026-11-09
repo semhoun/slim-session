@@ -12,6 +12,13 @@ publication is implied.
 - Explicit session creation, JSON-compatible data and flash values, configurable
   idle and absolute deadlines, renewal, atomic rotation, single-session
   revocation, and explicit save/close operations for streaming or long work.
+- Nested application-data paths such as `user.firstname` and `users.0.firstname`
+  in `get`, `has`, `set`, `delete`, `assign`, and session creation. Values are
+  stored as actual nested arrays. Bulk writes follow input order, replace leaves
+  rather than deep-merging, and remain atomic on failure. Missing parents are
+  created; existing non-array parents, including null, reject child writes.
+  PHP references are detached, JSON limits apply to the normalized data plus
+  flash, and flash keys remain literal.
 - Atomic session stores for PostgreSQL, MySQL, MariaDB, and SQLite through PDO,
   and Redis through ext-redis. SQL schemas are installed explicitly; Redis
   Cluster is not supported. Separate PDO and Redis PSR-16 caches do not replace
@@ -35,6 +42,17 @@ publication is implied.
   state subscriptions, coalesced initialization and refresh, automatic renewal,
   local expiration, logout, and teardown. Header credentials use memory by
   default, with optional sessionStorage persistence.
+
+### Changed
+
+- Application-data keys containing dots now represent paths, without escaping
+  or literal-key fallback. Empty paths and empty segments are rejected with
+  `InvalidSessionDataException`. Existing nested-array records remain valid,
+  but historical literal dotted keys are not automatically reinterpreted.
+  Applications using those keys must migrate their data or invalidate affected
+  sessions before adopting this behavior. Delete a scalar parent explicitly,
+  for example with `delete('user')`, before writing a child such as
+  `user.firstname`. See the [application data path contract](docs/contracts.md#application-data-paths).
 
 ### Security
 

@@ -19,6 +19,13 @@ raise the minimum runtime to the development host's PHP version. CI defines a
 three-version PHP matrix; a workflow definition alone is not proof it passed.
 
 SQLite tests run without external services when `pdo_sqlite` is installed.
+File-session contracts also run by default in isolated private temporary
+directories, including the shared multiprocess rotation/revocation tests.
+Filesystem-specific tests cover bounded physical lock contention, permissions,
+path/symlink rejection, corrupt records and leases, interrupted rotation recovery,
+fail-closed recovery errors, and cleanup. These are process-concurrency and
+recovery-state tests, not power-loss or network-filesystem certification.
+Cache providers exclude the session-only file backend.
 Real-backend contract tests use the following opt-in environment variables:
 
 | Backend | Configuration |
@@ -83,6 +90,14 @@ No verification command authorizes publishing, committing, pushing, deploying,
 or modifying the reference applications.
 
 ## Executed Checks
+
+The filesystem-backend change passed 152 tests and 868 assertions on PHP 8.3.36,
+8.4.27, and 8.5.12 with file and SQLite backends. PHP 8.3/8.4 ran in isolated
+containers with a read-only checkout and private temporary storage; PHP 8.5 ran
+on the host. PHPStan, Composer validation, `git diff --check`, and all 59 current
+example smoke checks also passed. External Redis/PostgreSQL/MySQL/MariaDB services
+were not rerun for this change. The results below describe earlier verification,
+not an expanded filesystem-backend matrix.
 
 The implementation session executed the following checks against isolated data:
 

@@ -10,7 +10,7 @@ use Semhoun\SlimSession\Exception\StorageUnavailableException;
 
 final class CacheContractTest extends TestCase
 {
-    #[DataProviderExternal(BackendFactory::class, 'backends')]
+    #[DataProviderExternal(BackendFactory::class, 'cacheBackends')]
     public function testTypesTtlsBulkAndNamespaceIsolation(string $backend): void
     {
         $connection = BackendFactory::connection($backend);
@@ -60,7 +60,7 @@ final class CacheContractTest extends TestCase
         }
     }
 
-    #[DataProviderExternal(BackendFactory::class, 'backends')]
+    #[DataProviderExternal(BackendFactory::class, 'cacheBackends')]
     public function testReservedKeysAreRejectedBeforeBulkWrites(string $backend): void
     {
         $cache = BackendFactory::cache(BackendFactory::connection($backend), 'invalid_' . bin2hex(random_bytes(8)));
@@ -74,7 +74,7 @@ final class CacheContractTest extends TestCase
         }
     }
 
-    #[DataProviderExternal(BackendFactory::class, 'backends')]
+    #[DataProviderExternal(BackendFactory::class, 'cacheBackends')]
     public function testUnauthenticatedPayloadNeverDeserializes(string $backend): void
     {
         $connection = BackendFactory::connection($backend);
@@ -96,7 +96,7 @@ final class CacheContractTest extends TestCase
         }
     }
 
-    #[DataProviderExternal(BackendFactory::class, 'backends')]
+    #[DataProviderExternal(BackendFactory::class, 'cacheBackends')]
     public function testHasAuthenticatesWithoutUnserializing(string $backend): void
     {
         $cache = BackendFactory::cache(BackendFactory::connection($backend), 'has_' . bin2hex(random_bytes(8)));

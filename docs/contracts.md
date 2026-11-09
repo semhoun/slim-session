@@ -90,6 +90,13 @@ an HTTP request. Install the matching SQL schema explicitly before serving
 requests. All reads must target the primary; asynchronous read replicas do not
 satisfy revocation guarantees.
 
+`FileSessionStore` implements the same session contract on trusted private local
+POSIX disk, with namespace-scoped short `flock` operations, JSON records and
+separate leases, atomic replacement, and a recoverable rotation journal. It also
+implements `SessionStoreMaintenance`; no filesystem PSR-16 cache is provided.
+See the [filesystem setup and failure limits](../README.md#local-filesystem-backend)
+before deployment. It is not a distributed or power-loss-durable backend.
+
 Pass a dedicated PDO connection with no application transaction open. SQL lock
 waits are bounded, but MySQL's server wait setting has one-second granularity;
 very small requested acquisition timeouts are therefore not hard real-time

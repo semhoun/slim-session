@@ -67,6 +67,64 @@ The [PHP contracts](docs/contracts.md) describe the lifecycle and atomic store
 interfaces. The [examples](examples/README.md) explain isolated setup and
 application-owned routing.
 
+## Local Filesystem Backend
+
+`FileSessionStore` stores one JSON record per session without a database or PHP
+object serialization. Use it only on a **local POSIX filesystem on one host**,
+not NFS, SMB, distributed volumes, or multiple hosts with independent disks.
+It is a session store only, not a PSR-16 cache.
+
+Provision a dedicated directory outside the web root, owned by the PHP worker
+account with mode `0700`. Pass its canonical absolute path (no symlink components
+or `..`). All workers must use the same directory and system clock.
+
+```php
+use Semhoun\SlimSession\Clock\SystemClock;
+use Semhoun\SlimSession\SessionConfig;
+use Semhoun\SlimSession\SessionManager;
+use Semhoun\SlimSession\Storage\FileSessionStore;
+
+// Provision /var/lib/my-app/sessions as the worker account, mode 0700 first.
+$store = new FileSessionStore('/var/lib/my-app/sessions');
+$manager = new SessionManager($store, new SessionConfig(namespace: 'my_app'), new SystemClock());
+```
+
+Each SHA-256 namespace directory contains `<id>.json` records, separate
+`<id>.lease` JSON metadata, and a **persistent `lock` file**. During writes there
+may also be `tmp-*` files and a `rotation` redo journal. Files use mode `0600`.
+Leases can exist without records; acquiring a lease never creates a session.
+The namespace lock coordinates short storage operations, not whole requests.
+Never unlink or replace the lock file while any worker can use the directory.
+Keep parent directories trusted and protected from replacement. Symlinks,
+hard-linked files, non-regular files, and non-private permissions are rejected;
+this is not a sandbox against processes running as the same OS account.
+
+Nonblocking `flock` retries have a monotonic deadline: `acquire()` uses its wait
+argument; other operations use `lockTimeoutMilliseconds` (default 2000).
+Slow filesystem I/O itself cannot be time-bounded by PHP. The default storage
+clock is system wall time; the optional `ClockInterface` is for controlled tests,
+not independently skewed worker clocks.
+
+Writes use same-directory temporary files and atomic rename. Rotation publishes
+a redo journal before removing the old ID and installing the new record and
+lease. Every operation first recovers any journal under the namespace lock;
+failed recovery makes the entire namespace unavailable rather than exposing a
+partial rotation. An error after journal publication has an **indeterminate
+outcome** to its caller and may complete on the next operation; never replay
+business mutations automatically. This handles process interruption, not full
+power-loss durability: directory entries are not fsynced, and disk/filesystem
+failure can lose acknowledged changes. Use a database backend when that guarantee
+is required. Do not restore stale snapshots into a live session directory.
+
+`cleanup($namespace, $limit)` and the existing probabilistic cleanup configuration
+are supported. At most `$limit` expired records and `$limit` expired leases are
+removed; records with live leases are retained. Each sweep has a 50ms scan budget
+(excluding filesystem I/O and lock wait). Large directories can require scheduled
+maintenance; sweeps restart at the beginning and do not guarantee progress past
+a very large live prefix. Cleanup never removes lock files, journals, unknown
+files, or crash-orphaned `tmp-*` files. Reclaim orphan temporary files only during
+offline maintenance with all workers stopped. Monitor disk space and inode use.
+
 ## Expired Session Cleanup
 
 Expired sessions are rejected on access regardless of cleanup. PDO retains expired
@@ -115,7 +173,7 @@ $session->saveAndClose();
 Probability accepts integer basis points 0..10000 (10000 always selects cleanup).
 Only stores implementing the optional `Storage\SessionStoreMaintenance` interface
 participate; other stores are a no-op, even when enabled. The atomic `SessionStore`
-interface is unchanged. PDO implements this capability.
+interface is unchanged. PDO and FileSessionStore implement this capability.
 
 A successful `create()` schedules one opportunity on that context, including
 creation through `absent()->create()`. Cleanup runs synchronously after successful

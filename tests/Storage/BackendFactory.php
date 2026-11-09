@@ -10,12 +10,19 @@ use Semhoun\SlimSession\Storage\PdoSessionStore;
 use Semhoun\SlimSession\Storage\RedisCache;
 use Semhoun\SlimSession\Storage\RedisSessionStore;
 use Semhoun\SlimSession\Storage\SessionStore;
+use Semhoun\SlimSession\Storage\FileSessionStore;
 
 final class BackendFactory
 {
     private static array $installed = [];
 
     public static function backends(): iterable
+    {
+        yield 'file' => ['file'];
+        yield from self::cacheBackends();
+    }
+
+    public static function cacheBackends(): iterable
     {
         yield 'sqlite' => ['sqlite'];
         foreach (['pgsql', 'mysql', 'mariadb'] as $driver) {
@@ -28,8 +35,25 @@ final class BackendFactory
         }
     }
 
-    public static function connection(string $backend, ?string $sqliteFile = null): PDO|\Redis
+    public static function connection(string $backend, ?string $sqliteFile = null): PDO|\Redis|FileSessionStore
     {
+        if ($backend === 'file') {
+            $directory = $sqliteFile === null ? sys_get_temp_dir() . '/session-files-' . bin2hex(random_bytes(8)) : $sqliteFile . '-files';
+            if (!is_dir($directory)) {
+                if (!mkdir($directory, 0700)) { throw new \RuntimeException('Cannot create test directory.'); }
+                $pid = getmypid();
+                register_shutdown_function(static function () use ($directory, $pid): void {
+                    if (getmypid() !== $pid) { return; }
+                    $files = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST);
+                    foreach ($files as $file) {
+                        if ($file->isDir() && !$file->isLink()) { rmdir($file->getPathname()); }
+                        else { unlink($file->getPathname()); }
+                    }
+                    rmdir($directory);
+                });
+            }
+            return new FileSessionStore($directory);
+        }
         if ($backend === 'redis') {
             if (!extension_loaded('redis')) {
                 throw new \RuntimeException('Configured Redis tests require ext-redis.');
@@ -61,15 +85,16 @@ final class BackendFactory
 
     public static function pdoBackends(): iterable
     {
-        foreach (self::backends() as $name => $arguments) {
+        foreach (self::cacheBackends() as $name => $arguments) {
             if ($name !== 'redis') {
                 yield $name => $arguments;
             }
         }
     }
 
-    public static function store(PDO|\Redis $connection): SessionStore
+    public static function store(PDO|\Redis|FileSessionStore $connection): SessionStore
     {
+        if ($connection instanceof FileSessionStore) { return $connection; }
         return $connection instanceof PDO ? new PdoSessionStore($connection) : new RedisSessionStore($connection);
     }
 

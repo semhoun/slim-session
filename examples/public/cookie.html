@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Same-Origin Cookie Session</title><link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/config.js" defer></script><script src="/assets/slim-session.js" defer></script><script src="/assets/demo.js" defer></script>
+</head>
+<body data-transport="cookie">
+<main>
+  <p class="eyebrow">Slim Session / Isolated Lab</p><h1>Server state.<br>Private cookie.</h1>
+  <p>The JWT stays in an HttpOnly, Secure cookie. This page only receives expiration metadata and a session-bound CSRF proof.</p>
+  <p id="state" role="status">Initializing</p>
+  <section aria-label="Session actions">
+    <button data-action="login">Simulate Login</button><button data-action="status">Status</button>
+    <button data-action="data">Read Data / Flash</button><button data-action="mutate">Increment</button>
+    <button data-action="flash">Queue Flash</button><button data-action="refresh">Refresh</button>
+    <button data-action="rotate">Rotate</button><button data-action="stream">Stream</button>
+    <button data-action="logout">Logout</button><button data-action="destroy">Local Teardown</button>
+  </section>
+  <pre id="output" aria-live="polite">No application request yet.</pre>
+  <h2>Two-Origin Widget</h2><p>The embedded page uses header credentials in memory, not third-party cookies.</p>
+  <iframe id="widget" title="Header session widget"></iframe>
+</main>
+</body></html>

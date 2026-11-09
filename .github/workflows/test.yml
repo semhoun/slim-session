@@ -1,0 +1,117 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4', '8.5']
+    services:
+      redis:
+        image: redis:7.4.12
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      postgres:
+        image: postgres:16.15
+        env:
+          POSTGRES_DB: session_test
+          POSTGRES_USER: session_test
+          POSTGRES_PASSWORD: disposable_test_only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U session_test -d session_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      mysql:
+        image: mysql:8.4.13
+        env:
+          MYSQL_DATABASE: session_test
+          MYSQL_ROOT_PASSWORD: disposable_test_only
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pdisposable_test_only"
+          --health-interval 5s --health-timeout 3s --health-retries 30
+      mariadb:
+        image: mariadb:11.4.13
+        env:
+          MARIADB_DATABASE: session_test
+          MARIADB_ROOT_PASSWORD: disposable_test_only
+        ports: ['3307:3306']
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-timeout 3s --health-retries 30
+    env:
+      SESSION_TEST_REDIS_HOST: 127.0.0.1
+      SESSION_TEST_REDIS_PORT: 6379
+      SESSION_TEST_PGSQL_DSN: pgsql:host=127.0.0.1;port=5432;dbname=session_test
+      SESSION_TEST_PGSQL_USER: session_test
+      SESSION_TEST_PGSQL_PASSWORD: disposable_test_only
+      SESSION_TEST_MYSQL_DSN: mysql:host=127.0.0.1;port=3306;dbname=session_test
+      SESSION_TEST_MYSQL_USER: root
+      SESSION_TEST_MYSQL_PASSWORD: disposable_test_only
+      SESSION_TEST_MARIADB_DSN: mysql:host=127.0.0.1;port=3307;dbname=session_test
+      SESSION_TEST_MARIADB_USER: root
+      SESSION_TEST_MARIADB_PASSWORD: disposable_test_only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo_sqlite, pdo_pgsql, pdo_mysql, redis, pcntl
+          coverage: none
+      - run: composer install --no-interaction --prefer-dist
+      - run: composer validate --strict
+      - run: composer test
+      - run: composer analyse
+  browser:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: browser
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: browser/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm pack --dry-run
+  e2e:
+    runs-on: ubuntu-24.04
+    env:
+      COMPOSER_ROOT_VERSION: dev-main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: pdo_sqlite, pcntl
+          coverage: none
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: composer install --no-interaction --prefer-dist
+      - run: composer install --no-interaction --prefer-dist --working-dir=examples
+      - run: npm ci
+        working-directory: browser
+      - run: npm run build
+        working-directory: browser
+      - run: npm ci
+        working-directory: e2e
+      - run: npx playwright install --with-deps chromium
+        working-directory: e2e
+      - run: npm test
+        working-directory: e2e

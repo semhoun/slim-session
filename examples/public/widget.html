@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Header Session Widget</title><link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/config.js" defer></script><script src="/assets/slim-session.js" defer></script><script src="/assets/demo.js" defer></script>
+</head>
+<body data-transport="header">
+<main>
+  <p class="eyebrow">Slim Session / Embedded Client</p><h1>A Different Origin.<br>A Deliberate Header.</h1>
+  <p>Explicit CORS allowlist. Header JWT held only in client memory. No ambient cookies are sent.</p>
+  <p id="state" role="status">Initializing</p>
+  <section aria-label="Session actions">
+    <button data-action="login">Simulate Login</button><button data-action="status">Status</button>
+    <button data-action="data">Read Data / Flash</button><button data-action="mutate">Increment</button>
+    <button data-action="flash">Queue Flash</button><button data-action="refresh">Refresh</button>
+    <button data-action="rotate">Rotate</button><button data-action="stream">Stream</button>
+    <button data-action="logout">Logout</button><button data-action="destroy">Local Teardown</button>
+  </section>
+  <pre id="output" aria-live="polite">No application request yet.</pre>
+</main>
+</body></html>

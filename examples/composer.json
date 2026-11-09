@@ -1,0 +1,17 @@
+{
+  "name": "semhoun/slim-session-examples",
+  "description": "Isolated local Slim session demonstrations",
+  "type": "project",
+  "license": "MIT",
+  "repositories": [{"type": "path", "url": "..", "options": {"symlink": true}}],
+  "require": {
+    "php": "^8.3",
+    "ext-pdo": "*",
+    "ext-pdo_sqlite": "*",
+    "semhoun/slim-session": "dev-main",
+    "slim/slim": "^4.15",
+    "slim/psr7": "^1.8"
+  },
+  "config": {"sort-packages": true},
+  "scripts": {"setup": "php bin/setup.php", "smoke": "php tests/smoke.php"}
+}

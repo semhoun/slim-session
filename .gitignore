@@ -1,0 +1,16 @@
+/vendor/
+/browser/node_modules/
+/browser/dist/
+/browser/coverage/
+/.phpunit.cache/
+/.phpstan.cache/
+/examples/var/
+/examples/vendor/
+/examples/typescript/node_modules/
+/e2e/node_modules/
+/e2e/test-results/
+/e2e/playwright-report/
+*.tgz
+*.zip
+.env
+/.kilo

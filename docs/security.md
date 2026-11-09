@@ -1,0 +1,135 @@
+# Security and Lifecycle Boundaries
+
+## Authentication Is Server-Side
+
+A session JWT is a signed reference, not a portable application identity. It
+contains only `sub`, `iss`, `aud`, `iat`, `nbf`, and `exp`. Every authenticated
+request checks server storage. Missing, revoked, idle-expired, and
+absolute-expired records cannot be restored by a valid JWT.
+
+Applications authenticate users and explicitly create sessions. User lookup,
+authorization, SSO, all-devices logout, and business transactions are outside
+this package. Do not accept session credentials in URLs. Use distinct
+application namespaces, issuers, audiences, signing keys, and cookie names.
+Existing application JWTs and remember credentials are intentionally unsupported.
+
+Signing secrets are injected raw bytes and must contain at least 32 bytes;
+generate them cryptographically, not from passwords. The HS256 keyring is a
+closed local map selected by `kid`; JWT-supplied key URLs are never resolved.
+Changing the active key does not require dropping older verification keys.
+Keep an old key only for the intended verification overlap, then remove it;
+removing a key immediately invalidates its JWTs regardless of stored records.
+
+## Deadlines
+
+Defaults are a 24-hour JWT, 24-hour idle timeout, seven-day absolute lifetime,
+and renewal during the JWT's final hour. JWT expiration never exceeds the
+absolute deadline. Activity cannot extend the absolute deadline. Status and
+refresh are not activity; server-side policy can exclude other routes.
+Unexcluded background polling can keep a session alive until its absolute
+deadline.
+
+An expired JWT cannot refresh itself, even if its record remains live. Closing
+or suspending a browser before its renewal window can therefore require
+reauthentication. A persistent cookie does not change this rule. JWT clock
+tolerance never extends storage deadlines.
+
+## Exactly One Transport
+
+Configure either cookies or headers for each integration, not automatic
+credential detection. Header integrations ignore ambient session cookies.
+Cookie integrations ignore unrelated authorization headers. Reject ambiguous
+credentials within the selected source. Independently mount and configure
+separate integrations if an application needs both.
+
+Use an application-specific `__Host-` cookie with Secure, HttpOnly, Path=/,
+no Domain, and SameSite=Lax. SameSite=None requires explicit authorization of
+origins and Secure. Third-party cookie restrictions still apply; embedded
+clients should use headers when appropriate. Cookie Max-Age follows the JWT
+deadline. Deletion must use the same cookie name and path.
+
+Cookie-authenticated unsafe requests require both an explicitly allowed Origin
+and the session-bound CSRF token in `X-CSRF-Token`. Missing and `null` origins
+fail closed. Bootstrap CSRF using the same-origin status endpoint. Do not
+derive trusted origins from unvalidated Host or forwarded headers. Login and
+session creation need application-level login-CSRF protection before a session
+exists. Business mutations must not use GET.
+
+Cookie-mode JavaScript must never receive the JWT. In header mode, prefer
+memory token storage; optional sessionStorage increases exposure to XSS.
+Neither mode protects an application against malicious same-origin scripts.
+
+## CORS and Response Handling
+
+CORS belongs to the host application. Use exact origin allowlists, never `*`
+with credentials, and send `Vary: Origin`. For header clients allow
+`Authorization` and `Content-Type`; for cookie clients allow `X-CSRF-Token`
+and enable credentials. Expose `X-Session-Token` only for header integrations,
+plus the configured expiration metadata headers. An OPTIONS preflight should
+not create a session or perform a business operation.
+
+Credential and status responses must use `Cache-Control: no-store`. Do not
+cache session responses in shared proxies. Do not log JWTs, cookies, secrets,
+or complete session identifiers. Client-side token parsing is not validation.
+
+## Locks and Side Effects
+
+The default acquisition timeout is two seconds and the lease duration is
+30 seconds. Mutable loading happens after acquiring a lease. Each write
+atomically checks ownership, lease validity, record existence, revision, and
+deadlines. A stale writer cannot upsert or resurrect a revoked session.
+Redis and SQL lease checks use storage time, not individual worker clocks.
+
+A session lease is not a transaction with application side effects. Business
+work can succeed before an expired lease causes session persistence to fail.
+Never automatically replay business requests. Applications need their own
+transactional or idempotency design when coordinating external effects.
+
+Call `saveAndClose()` before streaming or lengthy work. Mutation after close
+throws. Finalize the middleware response before emitting headers or body bytes;
+never call PHP's direct output/header functions inside the handler. Revalidate
+long streams periodically without holding a session lease. Revocation blocks
+subsequent checks, not previously authorized work or an unchecked open stream.
+
+## Commit and Failure Semantics
+
+Session states are absent, open, closed, and destroyed. Creation is explicit;
+clearing application data does not destroy the session. Closed or destroyed
+contexts do not silently reopen. Rotation requires an open context, creates a
+fresh random ID, invalidates the old ID atomically, and changes the CSRF proof.
+Ordinary JWT renewal does not rotate the ID.
+
+Normal handler returns commit open sessions, including 4xx responses: a handler
+may intentionally update attempt counters or flash messages. Uncaught handler
+exceptions discard uncommitted changes and release the lease. An earlier
+`saveAndClose()`, rotation, or destruction cannot be rolled back by a later
+exception. Put error-rendering middleware outside session middleware if thrown
+exceptions should discard pending session changes. If an inner error renderer
+converts an exception to a response, that is a normal return and commits.
+
+Response tokens are finalized only after successful persistence. Never turn a
+storage error into JWT-only authorization or a successful token response.
+Missing/invalid credentials and unavailable storage are different outcomes:
+
+| Status | Meaning |
+| --- | --- |
+| 401 | Invalid credential or missing/revoked/expired session |
+| 403 | Origin or CSRF proof rejected |
+| 409 | Lease loss or conditional-write conflict; do not replay automatically |
+| 503 | Storage unavailable or lock acquisition timed out |
+
+A protected route with no session context is a configuration failure, not a
+public route. Flash consumption persists under the session lease, but network
+failure prevents any exactly-once browser-delivery guarantee.
+
+## Browser Ordering and Cleanup
+
+Client generations reject late JavaScript responses, but cannot stop the
+browser applying an already received Set-Cookie header. A late cookie for a
+rotated or destroyed ID may replace a newer browser cookie. The server must
+still reject that old ID; this can cause reauthentication, never resurrection.
+Applications should avoid overlapping login/rotation/logout transitions.
+
+Local client destruction cancels work and clears local credentials; it is not
+confirmed server revocation. Failed logout must report revocation as
+unconfirmed. The browser client never retries a business mutation automatically.

@@ -1,0 +1,8 @@
+{
+  "name": "slim-session-typed-example",
+  "private": true,
+  "type": "module",
+  "dependencies": {"@semhoun/slim-session": "file:../../browser"},
+  "devDependencies": {"typescript": "^5.8.0"},
+  "scripts": {"typecheck": "tsc --noEmit"}
+}

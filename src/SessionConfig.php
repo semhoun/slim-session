@@ -12,10 +12,14 @@ final readonly class SessionConfig
         public int $acquisitionTimeoutMilliseconds = 2000,
         public int $maxDataBytes = 65536,
         public int $maxDataDepth = 32,
+        public int $cleanupProbabilityBasisPoints = 0,
+        public int $cleanupBatchSize = 100,
     ) {
         if ($namespace === '' || strlen($namespace) > 128 || !preg_match('/^[a-zA-Z0-9_.-]+$/D', $namespace)
             || min($idleLifetime, $absoluteLifetime, $leaseMilliseconds, $maxDataBytes, $maxDataDepth) < 1
-            || $acquisitionTimeoutMilliseconds < 0) {
+            || $acquisitionTimeoutMilliseconds < 0
+            || $cleanupProbabilityBasisPoints < 0 || $cleanupProbabilityBasisPoints > 10_000
+            || $cleanupBatchSize < 1 || $cleanupBatchSize > 10_000) {
             throw new \InvalidArgumentException('Invalid session configuration.');
         }
     }

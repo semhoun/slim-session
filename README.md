@@ -67,6 +67,74 @@ The [PHP contracts](docs/contracts.md) describe the lifecycle and atomic store
 interfaces. The [examples](examples/README.md) explain isolated setup and
 application-owned routing.
 
+## Expired Session Cleanup
+
+Expired sessions are rejected on access regardless of cleanup. PDO retains expired
+rows until swept; Redis uses TTLs and needs no sweep. Cleanup never extends a
+session deadline or deletes live rows, and is scoped to one application namespace.
+
+For manual PDO maintenance, use the same dedicated session connection and table
+prefix as your application (install the matching `schemas/` SQL first):
+
+```php
+use Semhoun\SlimSession\Storage\PdoSessionStore;
+
+// $pdo is your application's configured session PDO connection.
+$store = new PdoSessionStore($pdo);
+$deleted = $store->cleanup('my_app', 100);
+```
+
+The limit is 1..10000 expired rows **per table** (records and leases), so this
+call deletes at most 200 rows and returns their combined count. It does not sweep
+the separate PSR-16 cache. The database clock determines expiry, and deletion
+rechecks the deadline. Manual calls report storage failures to the caller.
+
+For predictable maintenance, put this call in an application-owned CLI command
+that bootstraps the session connection. Schedule it with cron or your job runner,
+for example once per minute. Use bounded batches and a job time budget, monitor
+failures, and prevent overlapping jobs. Run it for each configured namespace;
+never use a business transaction or a production database for tests.
+
+Alternatively, opt into opportunistic cleanup on newly created sessions:
+
+```php
+use Semhoun\SlimSession\Clock\SystemClock;
+use Semhoun\SlimSession\SessionConfig;
+use Semhoun\SlimSession\SessionManager;
+
+$config = new SessionConfig(
+    namespace: 'my_app',
+    cleanupProbabilityBasisPoints: 100, // 1%; default 0 disables cleanup.
+    cleanupBatchSize: 100,             // 1..10000 per table; default 100.
+);
+$manager = new SessionManager($store, $config, new SystemClock());
+$session = $manager->create(['user_id' => $authenticatedUserId]);
+$session->saveAndClose();
+```
+
+Probability accepts integer basis points 0..10000 (10000 always selects cleanup).
+Only stores implementing the optional `Storage\SessionStoreMaintenance` interface
+participate; other stores are a no-op, even when enabled. The atomic `SessionStore`
+interface is unchanged. PDO implements this capability.
+
+A successful `create()` schedules one opportunity on that context, including
+creation through `absent()->create()`. Cleanup runs synchronously after successful
+lease release on close/discard, including destroy or an error path that closes
+the context. It never runs inside creation or while holding that context's lease.
+Collision retries do not add opportunities; loads, saves, refreshes, and rotations
+do not schedule new ones. Repeated close calls do not retry cleanup. A context
+that is never closed does not run cleanup; failed lease release skips it too.
+
+Sampling uses the injected `RandomSource` (cryptographic by default), with unbiased
+rejection sampling. Disabled/always modes and unsupported stores need no random
+draw. Invalid random lengths, eight consecutive rejected samples, or sampling
+`RuntimeException`/`Random\RandomException` skip maintenance. Cleanup
+`StorageUnavailableException` is ignored: committed creation and response metadata
+are preserved, and business mutations are never replayed. Other programming errors
+propagate after lease release. Normal session-operation errors still propagate.
+Cleanup adds close-time latency and is not guaranteed to run on low-traffic sites;
+use scheduled maintenance when predictable reclamation and failure monitoring matter.
+
 ## Verification
 
 ### Breaking Session Format Change

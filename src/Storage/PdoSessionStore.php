@@ -10,7 +10,7 @@ use Semhoun\SlimSession\Exception\WriteConflictException;
 use Semhoun\SlimSession\Lease;
 use Semhoun\SlimSession\SessionRecord;
 
-final class PdoSessionStore implements SessionStore
+final class PdoSessionStore implements SessionStore, SessionStoreMaintenance
 {
     private readonly PdoInfrastructure $db;
 

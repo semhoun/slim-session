@@ -5,9 +5,11 @@ namespace Semhoun\SlimSession;
 use Psr\Clock\ClockInterface;
 use Semhoun\SlimSession\Data\JsonData;
 use Semhoun\SlimSession\Exception\InvalidSessionStateException;
+use Semhoun\SlimSession\Exception\StorageUnavailableException;
 use Semhoun\SlimSession\Exception\WriteConflictException;
 use Semhoun\SlimSession\Random\RandomSource;
 use Semhoun\SlimSession\Storage\SessionStore;
+use Semhoun\SlimSession\Storage\SessionStoreMaintenance;
 
 final class SessionContext
 {
@@ -15,6 +17,7 @@ final class SessionContext
     private JsonData $json;
     private ?SessionResponseMetadata $pending = null;
     private bool $issueToken = false;
+    private bool $cleanupPending = false;
     /** @var array<string, mixed> */
     private array $data = [];
     /** @var array<string, mixed> */
@@ -68,6 +71,7 @@ final class SessionContext
                     $this->state = SessionState::Open;
                     $this->issueToken = true;
                     $this->pending = new SessionResponseMetadata($record, true);
+                    $this->cleanupPending = true;
                     return;
                 }
             } catch (\Throwable $e) {
@@ -187,9 +191,39 @@ final class SessionContext
     public function discard(): void
     {
         $lease = $this->lease;
+        $cleanup = $this->cleanupPending;
+        $this->cleanupPending = false;
         $this->lease = null;
         if ($this->state === SessionState::Open) { $this->state = SessionState::Closed; }
         if ($lease !== null) { $this->store->release($lease); }
+        if ($cleanup) { $this->cleanupExpiredSessions(); }
+    }
+
+    private function cleanupExpiredSessions(): void
+    {
+        $chance = $this->config->cleanupProbabilityBasisPoints;
+        if ($chance === 0 || !$this->store instanceof SessionStoreMaintenance) {
+            return;
+        }
+        if ($chance < 10_000) {
+            // Reject the incomplete modulo bucket; cap work for faulty injected sources.
+            try {
+                for ($attempt = 0; $attempt < 8; ++$attempt) {
+                    $bytes = $this->random->bytes(2);
+                    if (strlen($bytes) !== 2) { return; }
+                    $sample = ord($bytes[0]) * 256 + ord($bytes[1]);
+                    if ($sample < 60_000) { break; }
+                }
+            } catch (\Random\RandomException|\RuntimeException) {
+                return;
+            }
+            if ($sample >= 60_000 || $sample % 10_000 >= $chance) { return; }
+        }
+        try {
+            $this->store->cleanup($this->config->namespace, $this->config->cleanupBatchSize);
+        } catch (StorageUnavailableException) {
+            // Ancillary maintenance must not invalidate a committed session operation.
+        }
     }
 
     private function open(): void

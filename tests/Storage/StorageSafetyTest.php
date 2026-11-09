@@ -11,6 +11,9 @@ use Semhoun\SlimSession\Exception\StorageUnavailableException;
 use Semhoun\SlimSession\Storage\PdoCache;
 use Semhoun\SlimSession\Storage\PdoSessionStore;
 use Semhoun\SlimSession\Storage\RecordCodec;
+use Semhoun\SlimSession\Clock\SystemClock;
+use Semhoun\SlimSession\SessionConfig;
+use Semhoun\SlimSession\SessionManager;
 
 final class StorageSafetyTest extends TestCase
 {
@@ -83,6 +86,36 @@ final class StorageSafetyTest extends TestCase
         } finally {
             $connection->rollBack();
         }
+    }
+
+    #[DataProviderExternal(BackendFactory::class, 'pdoBackends')]
+    public function testCreationCleanupPreservesLiveRowsAndOtherNamespaces(string $backend): void
+    {
+        $connection = BackendFactory::connection($backend);
+        $namespace = 'automatic_' . bin2hex(random_bytes(8));
+        $store = new PdoSessionStore($connection);
+        $payload = RecordCodec::encode(BackendContractTest::record('expired'));
+        foreach ([$namespace, $namespace . '_other'] as $application) {
+            for ($i = 0; $i < 3; ++$i) {
+                $connection->prepare('INSERT INTO slim_session_records VALUES (?,?,?,?,?)')->execute([$application, 'expired' . $i, 0, $payload, 0]);
+                $connection->prepare('INSERT INTO slim_session_leases VALUES (?,?,?,?)')->execute([$application, 'expired' . $i, 'expired', 0]);
+            }
+        }
+        $manager = new SessionManager($store, new SessionConfig($namespace, cleanupProbabilityBasisPoints: 10000, cleanupBatchSize: 1), new SystemClock());
+        $live = $manager->create(['live' => true]);
+        $created = $manager->create(['user' => 1]);
+        $created->saveAndClose();
+        foreach (['records', 'leases'] as $table) {
+            $query = $connection->prepare("SELECT COUNT(*) FROM slim_session_$table WHERE namespace=? AND expires_at=0");
+            $query->execute([$namespace]);
+            self::assertSame(2, (int) $query->fetchColumn());
+            $query->execute([$namespace . '_other']);
+            self::assertSame(3, (int) $query->fetchColumn());
+        }
+        self::assertSame(['user' => 1], $store->read($namespace, $created->record()->id)->data);
+        $live->set('still_leased', true);
+        $live->saveAndClose();
+        self::assertTrue($store->read($namespace, $live->record()->id)->data['still_leased']);
     }
 
     public function testTablePrefixCannotInjectSqlAndNoSchemaIsInstalledAutomatically(): void

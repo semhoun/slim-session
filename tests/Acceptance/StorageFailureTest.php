@@ -92,7 +92,7 @@ final class StorageFailureTest extends TestCase
         $record = $context->record();
         self::assertNotNull($record);
         $context->saveAndClose();
-        return [$this->jwt->issue($record->id, $record->absoluteExpiresAt), $record->id];
+        return [$this->jwt->issue($record->id, $record->absoluteExpiresAt, $record->verificationSecret), $record->id];
     }
 
     private function request(string $token): ServerRequestInterface

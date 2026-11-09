@@ -44,23 +44,29 @@ final class JwtService
         return min($this->clock->now()->getTimestamp() + $this->lifetime, $absoluteExpiresAt);
     }
 
-    public function issue(string $sessionId, int $absoluteExpiresAt): string
+    public function issue(string $sessionId, int $absoluteExpiresAt, string $verificationSecret): string
+    {
+        return $this->issueWithExpiry($sessionId, $absoluteExpiresAt, $verificationSecret)->token;
+    }
+
+    public function issueWithExpiry(string $sessionId, int $absoluteExpiresAt, string $verificationSecret): IssuedToken
     {
         $now = $this->clock->now();
         $now = $now->setTimestamp($now->getTimestamp());
-        $expiry = $this->expiresAt($absoluteExpiresAt);
-        if ($sessionId === '' || $expiry <= $now->getTimestamp()) {
+        $expiry = min($now->getTimestamp() + $this->lifetime, $absoluteExpiresAt);
+        if (!\Semhoun\SlimSession\SessionId::valid($sessionId) || !preg_match('/\A[a-f0-9]{64}\z/D', $verificationSecret) || $expiry <= $now->getTimestamp()) {
             throw new InvalidTokenException('Cannot issue a token for an expired session.');
         }
         $configuration = $this->configuration($this->activeKeyId);
         $token = $configuration->builder()->withHeader('kid', $this->activeKeyId)
             ->issuedBy($this->issuer)->permittedFor($this->audience)->relatedTo($sessionId)
+            ->withClaim('sv', 2)->withClaim('svp', $verificationSecret)
             ->issuedAt($now)->canOnlyBeUsedAfter($now)->expiresAt($now->setTimestamp($expiry))
             ->getToken($configuration->signer(), $configuration->signingKey())->toString();
         if (strlen($token) > $this->maximumBytes) {
             throw new InvalidTokenException('Token exceeds configured size.');
         }
-        return $token;
+        return new IssuedToken($token, $expiry);
     }
 
     public function verify(string $encoded): VerifiedToken
@@ -76,9 +82,10 @@ final class JwtService
                 || (isset($header['typ']) && $header['typ'] !== 'JWT') || !is_string($header['kid'] ?? null) || !isset($this->keys[$header['kid']])) {
                 throw new \UnexpectedValueException();
             }
-            $expected = ['sub', 'iss', 'aud', 'iat', 'nbf', 'exp'];
+            $expected = ['sub', 'iss', 'aud', 'iat', 'nbf', 'exp', 'sv', 'svp'];
             if (count($claims) !== count($expected) || array_diff($expected, array_keys($claims)) !== []
-                || !is_string($claims['sub']) || $claims['sub'] === '' || !is_string($claims['iss']) || $claims['iss'] !== $this->issuer
+                || !is_string($claims['sub']) || !\Semhoun\SlimSession\SessionId::valid($claims['sub']) || !is_string($claims['iss']) || $claims['iss'] !== $this->issuer
+                || $claims['sv'] !== 2 || !is_string($claims['svp']) || !preg_match('/\A[a-f0-9]{64}\z/D', $claims['svp'])
                 || ($claims['aud'] !== $this->audience && $claims['aud'] !== [$this->audience])
                 || !is_int($claims['iat']) || !is_int($claims['nbf']) || !is_int($claims['exp'])) {
                 throw new \UnexpectedValueException();
@@ -94,7 +101,7 @@ final class JwtService
             if (!$token instanceof UnencryptedToken || !$configuration->signer()->verify($token->signature()->hash(), $token->payload(), $configuration->verificationKey())) {
                 throw new \UnexpectedValueException();
             }
-            return new VerifiedToken($claims['sub'], $claims['iat'], $claims['exp']);
+            return new VerifiedToken($claims['sub'], $claims['iat'], $claims['exp'], $claims['svp']);
         } catch (\Throwable $error) {
             throw new InvalidTokenException('Invalid session credential.', 0, $error);
         }

@@ -17,7 +17,7 @@ final class InMemoryStoreTest extends TestCase
 
     private function record(string $id = 'id', int $revision = 0, int $idle = 1100, int $absolute = 1200): SessionRecord
     {
-        return new SessionRecord($id, $revision, [], [], 1000, 1000, $idle, $absolute, 'csrf');
+        return new SessionRecord($id, $revision, [], [], 1000, 1000, $idle, $absolute, 'csrf', str_repeat('a', 64));
     }
 
     public function testInsertOnlyRevisionAndNoUpsertAfterRevocation(): void

@@ -20,11 +20,12 @@ final class RecordCodec
     {
         try {
             $data = json_decode($payload, true, 64, JSON_THROW_ON_ERROR);
-            if (!is_array($data) || ($data['schemaVersion'] ?? null) !== 1
+            if (!is_array($data) || ($data['schemaVersion'] ?? null) !== 2
                 || !is_int($data['revision'] ?? null) || $data['revision'] < 0
                 || !is_string($data['id'] ?? null) || !preg_match('/\A[a-zA-Z0-9_-]{1,128}\z/D', $data['id'])
                 || ($expectedId !== null && $data['id'] !== $expectedId)
                 || !is_string($data['csrfToken'] ?? null) || $data['csrfToken'] === ''
+                || !is_string($data['verificationSecret'] ?? null) || !preg_match('/\A[a-f0-9]{64}\z/D', $data['verificationSecret'])
                 || !is_array($data['data'] ?? null) || !is_array($data['flash'] ?? null)) {
                 throw new \UnexpectedValueException('Invalid session record fields.');
             }
@@ -40,7 +41,7 @@ final class RecordCodec
                 id: $data['id'], revision: $data['revision'], data: $data['data'], flash: $data['flash'],
                 createdAt: $data['createdAt'], lastActivityAt: $data['lastActivityAt'],
                 idleExpiresAt: $data['idleExpiresAt'], absoluteExpiresAt: $data['absoluteExpiresAt'],
-                csrfToken: $data['csrfToken'], schemaVersion: $data['schemaVersion'],
+                csrfToken: $data['csrfToken'], verificationSecret: $data['verificationSecret'], schemaVersion: $data['schemaVersion'],
             );
         } catch (\Throwable $error) {
             throw new StorageUnavailableException('Invalid stored session record.', 0, $error);

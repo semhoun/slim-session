@@ -87,10 +87,11 @@ explicit API origin and `script-src` for your self-hosted external scripts.
 - `initialize()` fetches status with GET and bootstraps cookie CSRF. Concurrent calls coalesce. Call it after login and after resuming a suspended page when needed.
 - `request(url, init?)` sends exactly one request and returns the original Response. It never refreshes and retries application work, including GET. Caller cancellation through `init.signal` is supported. HTTP errors are returned, not automatically thrown.
 - `refresh()` sends POST and coalesces concurrent refresh calls. Invalid or expired credentials cannot recover themselves.
-- `logout()` sends POST, always clears local credentials, and returns `{revoked:boolean}`. Only a successful HTTP response confirms revocation; network, CSRF, and storage failures report false.
-- `destroy()` aborts client-owned requests, clears local storage and timers, notifies subscribers once, and removes listeners. It does not revoke the server session. Later operations throw.
+- `logout()` sends POST, always clears in-memory credentials, and returns `{revoked:boolean}`. Concurrent calls coalesce. Until it settles, `initialize()` and `refresh()` throw `SessionError`, and `request()` rejects with it. Only a successful HTTP response confirms revocation; network, CSRF, and server failures report false. Browser storage cleanup failures do not change this server result.
+- `destroy()` aborts client-owned requests, clears in-memory credentials and timers, attempts full tab sessionStorage clearing, notifies subscribers once, and removes listeners. It does not revoke the server session. Later operations throw.
 - `subscribe(listener)` returns an unsubscribe function. Notifications contain immutable state without JWT or CSRF secrets. Observer exceptions cannot interrupt cleanup.
 - `state` has `status` (`uninitialized`, `authenticated`, `unauthenticated`, `destroyed`), `metadata` (deadlines or null), and `revocation` (`none`, `confirmed`, `unconfirmed`). Authentication state describes the last server check, not a business permission.
+- `persistentCleanupFailed` reports module-wide sessionStorage quarantine after a failed clear or write, including in cookie/memory mode. It is independent of `state.revocation` and remains readable after destroy; successful recovery resets it for all clients.
 
 Required options are `application`, `baseUrl`, `transport`, and `endpoints`.
 `baseUrl` must be an absolute HTTP(S) URL without credentials, query, or fragment;
@@ -109,16 +110,43 @@ initialize before mutations and forbids JavaScript token storage configuration.
 
 Header credentials default to memory. Optional `storage: 'sessionStorage'`
 persists only the credential, namespaced by application and base origin/path.
-Unavailable or throwing storage falls back to memory. Different applications or
-base paths are isolated. Identically configured clients intentionally share the
+Unavailable or throwing storage falls back to memory. Normal writes to different
+applications or base paths are isolated. Identically configured clients share the
 same persisted slot; use separate application identifiers for independent scopes.
 Storage is not an XSS defense. Do not persist credentials in localStorage.
+
+**Cleanup is deliberately not namespaced.** Logout, destroy, 401, unauthenticated
+status, and local expiration call `sessionStorage.clear()` in all modes, including
+cookie and memory mode. This erases all data in the current page origin's tab
+sessionStorage, including unrelated drafts and other applications' credentials.
+The scope is the page origin, not the configured API origin. It does not erase
+localStorage, other tabs, or HttpOnly cookies. Cookie cleanup still needs server
+logout to confirm revocation.
+
+Cleanup invalidates other live clients sharing this module, clears their in-memory
+credentials and timers, aborts their requests, and rejects/ignores late responses.
+Failed clearing (including inaccessible storage) quarantines all stored-token
+restoration across the module. A new persistent client retries a full clear and
+starts without a restored credential even if recovery succeeds. An explicitly
+supplied new token remains usable in memory, but cannot persist until clear
+succeeds. Failed writes also quarantine potentially stale storage. Normal token
+writes never clear unrelated data unless recovering a quarantine.
+
+These protections are not durable across reloads, separate realms, or separate
+package copies; independent scripts can also write new data after clearing.
+Storage cannot be guaranteed erased when inaccessible. Check
+`persistentCleanupFailed` separately from server revocation. Confirmed server
+revocation remains essential, and cleanup of other clients does not revoke their
+server sessions. Reauthenticate affected clients explicitly.
 
 `autoRefresh` defaults to true. `refreshAheadSeconds` defaults to 3600. Scheduling
 uses server-provided Unix-second expiration metadata; it never parses the JWT.
 Automatic refresh has at most two retries after a failure, using exponential
 backoff. Failures do not replay business requests. Local expiration still clears
-credentials if refresh fails. Set `autoRefresh: false` to retain only expiry
+credentials if refresh fails or never settles, using an independent expiry timer.
+Expiration aborts outstanding requests and invalidates late responses. Long timer
+delays are clamped and rechecked rather than expiring or refreshing early.
+Set `autoRefresh: false` to retain only expiry
 scheduling and invoke refresh manually. Browser suspension may prevent renewal:
 an expired JWT requires reauthentication, even if the server record still exists.
 

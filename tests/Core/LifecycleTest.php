@@ -36,7 +36,7 @@ final class LifecycleTest extends TestCase
         self::assertNull($context->pendingResponse());
         $context->create(['nullable' => null, 'nested' => ['a' => [true, 1, 1.0]]]);
         $id = $context->record()->id;
-        self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/D', $id);
+        self::assertMatchesRegularExpression('/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/D', $id);
         self::assertTrue($context->has('nullable'));
         self::assertNull($context->get('nullable', 'default'));
         self::assertSame('default', $context->get('missing', 'default'));
@@ -68,6 +68,55 @@ final class LifecycleTest extends TestCase
         $context = $this->manager->absent();
         $this->expectException(InvalidSessionStateException::class);
         $context->set('user', 1);
+    }
+
+    public function testUuidGenerationAndIndependentSecretsSurvivePersistence(): void
+    {
+        $ids = [];
+        for ($i = 0; $i < 32; ++$i) {
+            $context = $this->manager->create();
+            $record = $context->record();
+            self::assertTrue(\Semhoun\SlimSession\SessionId::valid($record->id));
+            self::assertNotContains($record->id, $ids);
+            $ids[] = $record->id;
+            self::assertSame(2, $record->schemaVersion);
+            self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/D', $record->verificationSecret);
+            self::assertNotSame($record->verificationSecret, $record->csrfToken);
+            $context->saveAndClose();
+            $loaded = $this->manager->load($record->id);
+            $loaded->renew();
+            $loaded->saveAndClose();
+            self::assertSame($record->verificationSecret, $loaded->record()->verificationSecret);
+            $encoded = \Semhoun\SlimSession\Storage\RecordCodec::encode($loaded->record());
+            self::assertEquals($loaded->record(), \Semhoun\SlimSession\Storage\RecordCodec::decode($encoded, $record->id));
+        }
+    }
+
+    public function testLegacyRecordSchemaIsRejected(): void
+    {
+        $context = $this->manager->create();
+        $fields = get_object_vars($context->record());
+        $context->discard();
+        $fields['schemaVersion'] = 1;
+        unset($fields['verificationSecret']);
+        $this->expectException(\Semhoun\SlimSession\Exception\StorageUnavailableException::class);
+        \Semhoun\SlimSession\Storage\RecordCodec::decode(json_encode($fields, JSON_THROW_ON_ERROR));
+    }
+
+    public function testCoreLoadRejectsNoncanonicalIdentifiers(): void
+    {
+        foreach ([str_repeat('a', 64), 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE',
+            'aaaaaaaa-bbbb-5ccc-8ddd-eeeeeeeeeeee', 'aaaaaaaa-bbbb-4ccc-7ddd-eeeeeeeeeeee'] as $id) {
+            $context = $this->manager->create();
+            $fields = get_object_vars($context->record());
+            $context->discard();
+            $fields['id'] = $id;
+            $lease = $this->store->acquire('app', $id, 'fixture', 30000, 0);
+            $this->store->create('app', new \Semhoun\SlimSession\SessionRecord(...$fields), $lease);
+            $this->store->release($lease);
+            try { $this->manager->load($id); self::fail('Noncanonical identifier loaded.'); }
+            catch (SessionNotFoundException) { self::assertTrue(true); }
+        }
     }
 
     public function testFlashConsumptionPersistsButDiscardDoesNot(): void

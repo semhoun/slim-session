@@ -62,6 +62,8 @@ try {
         $assert($request('POST', $base . 'login', $badLoginHeaders, ['username' => 'demo'])->getStatusCode() === 403, 'Forged login proof accepted.');
         $login = $request('POST', $base . 'login', $loginHeaders, ['username' => 'demo']);
         $assert($login->getStatusCode() === 201, 'Explicit session login failed for ' . $mode . ': ' . $login->getStatusCode() . ' ' . (string) $login->getBody());
+        $assert($login->getHeaderLine('Access-Control-Expose-Headers') === ($mode === 'cookie' ? 'X-CSRF-Token' : 'X-Session-Token')
+            . ', X-Session-Token-Expires-At, X-Session-Idle-Expires-At, X-Session-Absolute-Expires-At', 'Exposed headers do not match transport.');
         if ($mode === 'cookie') {
             $headers['Cookie'] = $cookieFrom($login, '__Host-example-session');
             $assert(!$login->hasHeader('X-Session-Token'), 'Cookie JWT leaked into response token header.');
@@ -71,7 +73,12 @@ try {
             $assert(!$login->hasHeader('Set-Cookie'), 'Header authentication emitted cookies.');
         }
         $status = $request('GET', $base . 'session/status', $headers);
+        $encoded = $mode === 'cookie' ? explode('=', $headers['Cookie'], 2)[1] : substr($headers['Authorization'], 7);
+        $claims = json_decode(base64_decode(strtr(explode('.', $encoded)[1], '-_', '+/')), true, flags: JSON_THROW_ON_ERROR);
+        $assert(\Semhoun\SlimSession\SessionId::valid($claims['sub']), 'Session ID is not canonical UUIDv4.');
+        $assert($claims['sv'] === 2 && preg_match('/^[a-f0-9]{64}$/D', $claims['svp']) === 1, 'Missing versioned verification proof.');
         $metadata = json_decode((string) $status->getBody(), true, flags: JSON_THROW_ON_ERROR);
+        $assert(!array_key_exists('svp', $metadata) && !array_key_exists('verificationSecret', $metadata), 'Verification secret leaked in metadata.');
         $assert($metadata['authenticated'] === true && $metadata['transport'] === $mode, 'Status protocol mismatch.');
         if ($mode === 'cookie') {
             $assert($request('POST', $base . 'data', $headers)->getStatusCode() === 403, 'Cookie mutation without CSRF accepted.');

@@ -43,6 +43,9 @@ final class SessionMiddleware implements MiddlewareInterface
             $token = $credential === null ? null : $this->jwt->verify($credential);
             $activity = $this->activityPolicy === null || ($this->activityPolicy)($request);
             $context = $token === null ? $this->manager->absent() : $this->manager->load($token->sessionId, $activity);
+            if ($token !== null && !hash_equals($context->record()->verificationSecret ?? '', $token->verificationSecret)) {
+                throw new InvalidTokenException('Invalid session credential.');
+            }
             if ($token !== null && $this->config->transport === 'cookie') {
                 $this->protect($request, $context);
             }
@@ -132,8 +135,9 @@ final class SessionMiddleware implements MiddlewareInterface
         } elseif (($record = $pending->record ?? $context->record()) !== null) {
             $expiry = $token?->expiresAt;
             if ($pending?->issueToken) {
-                $encoded = $this->jwt->issue($record->id, $record->absoluteExpiresAt);
-                $expiry = $this->jwt->verify($encoded)->expiresAt;
+                $issued = $this->jwt->issueWithExpiry($record->id, $record->absoluteExpiresAt, $record->verificationSecret);
+                $encoded = $issued->token;
+                $expiry = $issued->expiresAt;
                 $response = $this->config->transport === 'cookie'
                     ? $response->withAddedHeader('Set-Cookie', $this->cookie($encoded, max(0, $expiry - $this->clock->now()->getTimestamp())))
                     : $response->withHeader($this->config->responseTokenHeader, $encoded);

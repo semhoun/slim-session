@@ -91,6 +91,52 @@ describe('transport and scope', () => {
 });
 
 describe('lifecycle and concurrency', () => {
+  it.each([
+    ['header', 'before'], ['header', 'after'], ['cookie', 'before'], ['cookie', 'after'],
+  ] as const)('blocks new %s operations during logout with stale status settling %s logout', async (transport, order) => {
+    const body = deferred<unknown>();
+    const logout = deferred<Response>();
+    const stale = status(transport);
+    vi.spyOn(stale, 'json').mockReturnValue(body.promise);
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(status(transport))
+      .mockResolvedValueOnce(stale).mockReturnValueOnce(logout.promise);
+    const instance = client(fetcher, { transport });
+    await instance.initialize();
+    const pending = instance.initialize();
+    await vi.waitFor(() => expect(stale.json).toHaveBeenCalled());
+    const observed: string[] = [];
+    const reentrant: unknown[] = [];
+    const unsubscribe = instance.subscribe(state => {
+      observed.push(`${state.status}:${state.revocation}`);
+      try { instance.initialize(); } catch (error) { reentrant.push(error); }
+    });
+    const first = instance.logout();
+    expect(instance.logout()).toBe(first);
+    expect(() => instance.initialize()).toThrow('logout');
+    expect(() => instance.refresh()).toThrow('logout');
+    await expect(instance.request('data')).rejects.toThrow('logout');
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    const init = fetcher.mock.lastCall?.[1];
+    expect(init?.signal?.aborted).toBe(false);
+    expect(new Headers(init?.headers).get(transport === 'cookie' ? 'X-CSRF-Token' : 'Authorization'))
+      .toBe(transport === 'cookie' ? 'csrf-one' : 'Bearer initial');
+    const settleStatus = async () => {
+      body.resolve({ authenticated: true, transport, ...deadlines(), csrfToken: 'stale' });
+      await pending;
+    };
+    if (order === 'before') await settleStatus();
+    logout.resolve(new Response(null, { status: 204 }));
+    expect(await first).toEqual({ revoked: true });
+    if (order === 'after') await settleStatus();
+    expect(observed).toEqual(['unauthenticated:unconfirmed', 'unauthenticated:confirmed']);
+    expect(reentrant).toHaveLength(2);
+    expect(instance.state).toMatchObject({ status: 'unauthenticated', revocation: 'confirmed' });
+    unsubscribe();
+    fetcher.mockResolvedValueOnce(Response.json({ authenticated: false, transport }));
+    await instance.initialize();
+    expect(instance.state.status).toBe('unauthenticated');
+  });
+
   it.each(['header', 'cookie'] as const)('does not regress %s deadlines or credentials from a late same-session response', async transport => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
@@ -272,6 +318,182 @@ describe('lifecycle and concurrency', () => {
 });
 
 describe('metadata, storage and scheduling', () => {
+  it('allows peer observers to destroy clients during global cleanup without recursive notifications', () => {
+    const clear = vi.fn();
+    vi.stubGlobal('sessionStorage', { clear });
+    const one = client(vi.fn<typeof fetch>());
+    const two = client(vi.fn<typeof fetch>());
+    const three = client(vi.fn<typeof fetch>());
+    two.subscribe(() => { three.destroy(); two.destroy(); });
+    one.destroy();
+    expect(clear).toHaveBeenCalledTimes(1);
+    expect(two.state.status).toBe('destroyed');
+    expect(three.state.status).toBe('destroyed');
+  });
+
+  it.each(['header', 'cookie'] as const)('clears unrelated tab data on %s logout and blocks peer restoration', async transport => {
+    const map = new Map<string, string>();
+    const clear = vi.fn(() => map.clear());
+    vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => map.set(key, value), clear });
+    const pending = deferred<Response>();
+    const peerFetch = vi.fn<typeof fetch>().mockReturnValueOnce(pending.promise).mockResolvedValue(new Response());
+    const peer = client(peerFetch, { application: 'peer', storage: 'sessionStorage' });
+    const inFlight = peer.request('pending');
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async url => String(url).endsWith('/logout') ? new Response() : status(transport));
+    const instance = client(fetcher, { transport });
+    await instance.initialize();
+    map.set('unrelated-draft', 'must disappear');
+    const before = clear.mock.calls.length;
+    await instance.logout();
+    expect(clear).toHaveBeenCalledTimes(before + 1);
+    expect(map.size).toBe(0);
+    expect(instance.persistentCleanupFailed).toBe(false);
+    expect(peer.state.status).toBe('unauthenticated');
+    pending.resolve(new Response(null, { headers: metadataHeaders('stale') }));
+    await expect(inFlight).rejects.toThrow('Stale');
+    await peer.request('check');
+    expect(new Headers(peerFetch.mock.lastCall?.[1]?.headers).has('Authorization')).toBe(false);
+    expect(map.size).toBe(0);
+  });
+
+  it('does not clear unrelated storage during normal credential persistence', async () => {
+    const map = new Map<string, string>();
+    const clear = vi.fn(() => map.clear());
+    vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => map.set(key, value), clear });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(status('header', 'renewed'));
+    const instance = client(fetcher, { storage: 'sessionStorage' });
+    clear.mockClear();
+    map.set('draft', 'keep');
+    await instance.initialize();
+    expect(clear).not.toHaveBeenCalled();
+    expect(map.get('draft')).toBe('keep');
+  });
+
+  it('reports cookie cleanup failure globally and recovers with a full clear', async () => {
+    const map = new Map([['unrelated', 'draft'], ['slim-session:other', 'stale']]);
+    let fail = true;
+    vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => map.set(key, value),
+      clear: () => { if (fail) throw Error('blocked'); map.clear(); } });
+    const cookie = client(vi.fn<typeof fetch>(), { transport: 'cookie' });
+    cookie.destroy();
+    expect(cookie.persistentCleanupFailed).toBe(true);
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response());
+    const restored = client(fetcher, { application: 'other', storage: 'sessionStorage', token: '' });
+    await restored.request('check');
+    expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).has('Authorization')).toBe(false);
+    expect(restored.persistentCleanupFailed).toBe(true);
+    fail = false;
+    client(fetcher, { storage: 'sessionStorage', token: 'fresh' });
+    expect([...map.values()]).toEqual(['fresh']);
+    expect(cookie.persistentCleanupFailed).toBe(false);
+  });
+
+  it.each(['throws', 'unavailable'] as const)('quarantines failed cleanup when storage %s until removal succeeds', async failure => {
+    const map = new Map<string, string>();
+    let fail = false;
+    const storage = {
+      getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => { map.set(key, value); },
+      clear: () => { if (fail) throw Error('blocked'); map.clear(); },
+    };
+    vi.stubGlobal('sessionStorage', storage);
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
+    const options = { storage: 'sessionStorage' as const, application: `quarantine-${failure}` };
+    const restore = () => {
+      const config = { ...defaults, ...options, fetch: fetcher };
+      delete config.token;
+      const instance = createSessionClient(config);
+      clients.push(instance);
+      return instance;
+    };
+    const original = client(fetcher, options);
+    fail = true;
+    if (failure === 'unavailable') vi.stubGlobal('sessionStorage', undefined);
+    expect(await original.logout()).toEqual({ revoked: true });
+    expect(original.persistentCleanupFailed).toBe(true);
+    expect(original.state.revocation).toBe('confirmed');
+    vi.stubGlobal('sessionStorage', storage);
+    const restored = restore();
+    await restored.request('check');
+    expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).has('Authorization')).toBe(false);
+    expect(restored.persistentCleanupFailed).toBe(true);
+    const explicit = client(fetcher, { ...options, token: 'new-login' });
+    await explicit.request('check');
+    expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).get('Authorization')).toBe('Bearer new-login');
+    expect([...map.values()]).toEqual(['initial']);
+    expect(explicit.persistentCleanupFailed).toBe(true);
+    fail = false;
+    const cleaned = restore();
+    expect(cleaned.persistentCleanupFailed).toBe(false);
+    expect(map.size).toBe(0);
+    client(fetcher, { ...options, token: 'fresh' });
+    const fresh = restore();
+    await fresh.request('check');
+    expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).get('Authorization')).toBe('Bearer fresh');
+  });
+
+  it.each(['tokenExpiresAt', 'idleExpiresAt', 'absoluteExpiresAt'] as const)('expires at %s while automatic refresh hangs and ignores late responses', async deadline => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const pending = deferred<Response>();
+    const business = deferred<Response>();
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({
+      authenticated: true, transport: 'header', ...deadlines(), [deadline]: Date.now() / 1000 + 3,
+    })).mockReturnValueOnce(business.promise).mockReturnValueOnce(pending.promise).mockResolvedValue(new Response());
+    const instance = client(fetcher, { autoRefresh: true, refreshAheadSeconds: 7200 });
+    await instance.initialize();
+    const request = instance.request('pending');
+    await vi.advanceTimersByTimeAsync(1000);
+    const refresh = instance.refresh();
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(instance.state.status).toBe('unauthenticated');
+    expect(fetcher.mock.calls[2]?.[1]?.signal?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    pending.resolve(status('header', 'late'));
+    business.resolve(new Response(null, { headers: metadataHeaders('late-business') }));
+    await refresh;
+    await expect(request).rejects.toThrow('Stale');
+    expect(instance.state.status).toBe('unauthenticated');
+    await instance.request('check');
+    expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).has('Authorization')).toBe(false);
+  });
+
+  it.each([false, true])('clamps long deadlines without early expiry or refresh (auto=%s)', async autoRefresh => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const expiresAt = Date.now() / 1000 + 3_000_000;
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ authenticated: true, transport: 'header',
+      tokenExpiresAt: expiresAt, idleExpiresAt: expiresAt, absoluteExpiresAt: expiresAt }));
+    const instance = client(fetcher, { autoRefresh, refreshAheadSeconds: 0 });
+    await instance.initialize();
+    await vi.advanceTimersByTimeAsync(2_147_483_647);
+    expect(instance.state.status).toBe('authenticated');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(3_000_000_000 - 2_147_483_647);
+    expect(instance.state.status).toBe('unauthenticated');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('replaces expiry scheduling after successful refresh and clears both timers on logout', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({
+      authenticated: true, transport: 'cookie', ...deadlines(), tokenExpiresAt: Date.now() / 1000 + 3, csrfToken: 'csrf-one',
+    })).mockImplementation(async url => String(url).endsWith('/logout') ? new Response() : status('cookie'));
+    const instance = client(fetcher, { transport: 'cookie', autoRefresh: true, refreshAheadSeconds: 2 });
+    await instance.initialize();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(instance.state.status).toBe('authenticated');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(2);
+    await instance.logout();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('rejects malformed, mismatched and expired session metadata', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ authenticated: true, transport: 'cookie', ...deadlines() })).mockResolvedValueOnce(Response.json({ authenticated: true, transport: 'header', tokenExpiresAt: 'bad' })).mockResolvedValueOnce(Response.json({ authenticated: true, transport: 'header', ...deadlines(), tokenExpiresAt: 1 }));
     const instance = client(fetcher);
@@ -286,17 +508,17 @@ describe('metadata, storage and scheduling', () => {
     await expect(instance.request('data')).rejects.toThrow('metadata');
   });
 
-  it('uses isolated application and base path storage keys and removes only its own credential', async () => {
+  it('uses isolated storage keys for writes but clears all tab data on destruction', async () => {
     const map = new Map<string, string>();
-    vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null, setItem: (key: string, value: string) => map.set(key, value), removeItem: (key: string) => map.delete(key) });
+    vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null, setItem: (key: string, value: string) => map.set(key, value), clear: () => map.clear() });
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(status());
     const one = client(fetcher, { storage: 'sessionStorage' });
     client(fetcher, { storage: 'sessionStorage', application: 'two', token: 'two' });
     client(fetcher, { storage: 'sessionStorage', baseUrl: 'https://api.example.test/other/', token: 'three' });
     expect(map.size).toBe(3);
+    map.set('unrelated', 'draft');
     one.destroy();
-    expect(map.size).toBe(2);
-    expect([...map.values()].sort()).toEqual(['three', 'two']);
+    expect(map.size).toBe(0);
   });
 
   it('falls back to memory on all storage failures', async () => {

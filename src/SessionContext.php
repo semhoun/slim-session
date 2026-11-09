@@ -55,11 +55,11 @@ final class SessionContext
         }
         $this->json->validate($data, []);
         for ($attempt = 0; $attempt < 5; ++$attempt) {
-            $id = $this->secret();
+            $id = SessionId::generate($this->random);
             $lease = $this->store->acquire($this->config->namespace, $id, $this->secret(), $this->config->leaseMilliseconds, $this->config->acquisitionTimeoutMilliseconds);
             try {
                 $now = $this->clock->now()->getTimestamp();
-                $record = new SessionRecord($id, 0, $this->json->copy($data), [], $now, $now, $now + min($this->config->idleLifetime, $this->config->absoluteLifetime), $now + $this->config->absoluteLifetime, $this->secret());
+                $record = new SessionRecord($id, 0, $this->json->copy($data), [], $now, $now, $now + min($this->config->idleLifetime, $this->config->absoluteLifetime), $now + $this->config->absoluteLifetime, $this->secret(), $this->secret());
                 if ($this->store->create($this->config->namespace, $record, $lease)) {
                     $this->record = $record;
                     $this->lease = $lease;
@@ -156,7 +156,7 @@ final class SessionContext
     {
         $this->open();
         $current = $this->snapshot();
-        $record = new SessionRecord($this->secret(), 0, $preserveData ? $current->data : [], $preserveData ? $current->flash : [], $current->createdAt, $current->lastActivityAt, $current->idleExpiresAt, $current->absoluteExpiresAt, $this->secret());
+        $record = new SessionRecord(SessionId::generate($this->random), 0, $preserveData ? $current->data : [], $preserveData ? $current->flash : [], $current->createdAt, $current->lastActivityAt, $current->idleExpiresAt, $current->absoluteExpiresAt, $this->secret(), $this->secret());
         try {
             $lease = $this->store->rotate($this->config->namespace, $this->record->id, $this->record->revision, $record, $this->lease());
         } catch (\Throwable $e) {
@@ -208,7 +208,7 @@ final class SessionContext
     {
         $r = $this->record ?? throw new InvalidSessionStateException('Session is absent.');
         $this->json->validate($this->data, $this->flash);
-        return new SessionRecord($r->id, $r->revision + 1, $this->data, $this->flash, $r->createdAt, $this->activityAt, min($r->absoluteExpiresAt, $this->activityAt + $this->config->idleLifetime), $r->absoluteExpiresAt, $r->csrfToken);
+        return new SessionRecord($r->id, $r->revision + 1, $this->data, $this->flash, $r->createdAt, $this->activityAt, min($r->absoluteExpiresAt, $this->activityAt + $this->config->idleLifetime), $r->absoluteExpiresAt, $r->csrfToken, $r->verificationSecret);
     }
 
     private function secret(): string

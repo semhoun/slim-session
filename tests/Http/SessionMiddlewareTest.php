@@ -60,12 +60,63 @@ final class SessionMiddlewareTest extends TestCase
         $context = $this->manager->create(['count' => 0]);
         $record = $context->record();
         $context->saveAndClose();
-        return [$record->id, $this->jwt->issue($record->id, $record->absoluteExpiresAt), $record->csrfToken];
+        return [$record->id, $this->jwt->issue($record->id, $record->absoluteExpiresAt, $record->verificationSecret), $record->csrfToken];
     }
 
     private function request(string $token, string $method = 'GET'): ServerRequest
     {
         return new ServerRequest($method, 'https://example.test/session', ['Authorization' => 'Bearer ' . $token]);
+    }
+
+    public function testSignedWrongProofFailsBeforeBusinessAndReleasesLeaseInBothTransports(): void
+    {
+        foreach (['header', 'cookie'] as $transport) {
+            [$id, $valid, $csrf] = $this->session();
+            $record = $this->store->read('http-test', $id);
+            foreach ([bin2hex(random_bytes(32)), $csrf] as $wrongProof) {
+                $forged = $this->jwt->issue($id, $record->absoluteExpiresAt, $wrongProof);
+                $request = $transport === 'header' ? $this->request($forged, 'POST')
+                    : new ServerRequest('POST', '/', ['Cookie' => '__Host-slim-session=' . $forged,
+                        'Origin' => 'https://example.test', 'X-CSRF-Token' => $csrf]);
+                $response = $this->middleware($transport)->process($request, $this->handler(function () {
+                    self::fail('A signed token with the wrong record proof must not reach business code.');
+                }));
+                self::assertSame(401, $response->getStatusCode());
+                self::assertSame($record, $this->store->read('http-test', $id));
+                self::assertFalse($response->hasHeader('X-Session-Token'));
+                $loaded = $this->manager->load($id);
+                $loaded->discard();
+            }
+            $request = $transport === 'header' ? $this->request($valid)
+                : new ServerRequest('GET', '/', ['Cookie' => '__Host-slim-session=' . $valid]);
+            self::assertSame(200, $this->middleware($transport)->process($request, new StatusHandler($this->factory))->getStatusCode());
+        }
+    }
+
+    public function testRotationInvalidatesOldIdAndProofInBothTransports(): void
+    {
+        foreach (['header', 'cookie'] as $transport) {
+            [$id, $oldToken] = $this->session();
+            $old = $this->store->read('http-test', $id);
+            $context = $this->manager->load($id);
+            $context->rotate();
+            $new = $context->record();
+            $context->saveAndClose();
+            self::assertNotSame($old->verificationSecret, $new->verificationSecret);
+            self::assertNotSame($old->csrfToken, $new->csrfToken);
+            self::assertNull($this->store->read('http-test', $id));
+            foreach ([$oldToken, $this->jwt->issue($new->id, $new->absoluteExpiresAt, $old->verificationSecret)] as $invalid) {
+                $request = $transport === 'header' ? $this->request($invalid)
+                    : new ServerRequest('GET', '/', ['Cookie' => '__Host-slim-session=' . $invalid]);
+                self::assertSame(401, $this->middleware($transport)->process($request, $this->handler(function () {
+                    self::fail('Rotated credentials must not reach business code.');
+                }))->getStatusCode());
+            }
+            $valid = $this->jwt->issue($new->id, $new->absoluteExpiresAt, $new->verificationSecret);
+            $request = $transport === 'header' ? $this->request($valid)
+                : new ServerRequest('GET', '/', ['Cookie' => '__Host-slim-session=' . $valid]);
+            self::assertSame(200, $this->middleware($transport)->process($request, new StatusHandler($this->factory))->getStatusCode());
+        }
     }
 
     public function testMissingCredentialsStayAbsentAndGuardRejectsMissingMiddleware(): void
@@ -87,8 +138,29 @@ final class SessionMiddlewareTest extends TestCase
             return $this->factory->createResponse();
         }));
         $token = $this->jwt->verify($response->getHeaderLine('X-Session-Token'));
+        self::assertSame((string) $token->expiresAt, $response->getHeaderLine('X-Session-Token-Expires-At'));
         self::assertTrue($this->store->read('http-test', $token->sessionId)->data['saved']);
         self::assertSame('no-store', $response->getHeaderLine('Cache-Control'));
+    }
+
+    public function testFinalizationUsesIssuedExpiryWithoutReadingJwtClockAgain(): void
+    {
+        $clock = new class implements ClockInterface {
+            public int $calls = 0;
+            public function now(): \DateTimeImmutable
+            {
+                return new \DateTimeImmutable('@' . (1700000000 + $this->calls++));
+            }
+        };
+        $this->jwt = new JwtService($clock, 'http-test', 'http-test', ['current' => str_repeat('a', 32)], 'current', lifetime: 1);
+        $response = $this->middleware()->process(new ServerRequest('POST', '/login'), $this->handler(function ($request) {
+            SessionGuard::context($request)->create();
+            return $this->factory->createResponse();
+        }));
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame(1, $clock->calls);
+        self::assertNotSame('', $response->getHeaderLine('X-Session-Token'));
+        self::assertSame('1700000001', $response->getHeaderLine('X-Session-Token-Expires-At'));
     }
 
     public function testNormalFourHundredPersistsAndExceptionDiscardsAndReleases(): void
@@ -192,7 +264,8 @@ final class SessionMiddlewareTest extends TestCase
         }
         self::assertNull($this->store->read('http-test', $id));
         self::assertNotNull($this->store->read('http-test', $newId));
-        $newToken = $this->jwt->issue($newId, $this->store->read('http-test', $newId)->absoluteExpiresAt);
+        $newRecord = $this->store->read('http-test', $newId);
+        $newToken = $this->jwt->issue($newId, $newRecord->absoluteExpiresAt, $newRecord->verificationSecret);
         try {
             $this->middleware()->process($this->request($newToken), $this->handler(function ($request) {
                 SessionGuard::requireSession($request)->destroy();
@@ -242,7 +315,7 @@ final class SessionMiddlewareTest extends TestCase
         $context = $manager->create();
         $record = $context->record();
         $context->saveAndClose();
-        $token = $this->jwt->issue($record->id, $record->absoluteExpiresAt);
+        $token = $this->jwt->issue($record->id, $record->absoluteExpiresAt, $record->verificationSecret);
         $this->clock->time += 10;
         $middleware = new SessionMiddleware($manager, $this->jwt, new HttpConfig('header', 'https://example.test'), $this->clock, $this->factory);
         $response = $middleware->process($this->request($token, 'POST'), new RefreshHandler($this->factory));

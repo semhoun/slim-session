@@ -5,8 +5,9 @@ browser client. The PHP core uses PSR-7/15/17/20 interfaces; Slim is only an
 example integration.
 
 `semhoun/slim-session` keeps application data on the server. HS256 JWTs carry
-only a random session ID and technical validation claims. Authentication
-always checks storage. A PSR-16 cache alone is not a session store.
+only a cryptographic UUIDv4 session ID and technical validation claims, including
+an independent per-session verification secret. Authentication always checks
+storage and compares that secret in constant time. A PSR-16 cache alone is not a session store.
 
 ## Packages
 
@@ -67,6 +68,25 @@ interfaces. The [examples](examples/README.md) explain isolated setup and
 application-owned routing.
 
 ## Verification
+
+### Breaking Session Format Change
+
+Session records now use schema version `2`, with a required `verificationSecret`
+field (32 random bytes encoded as 64 lowercase hex characters). JWTs require
+`sv: 2` and the matching `svp` proof, and `sub` must be a canonical lowercase
+UUIDv4. Old 64-hex session IDs, schema-v1 records, and previous JWTs are rejected;
+there is no compatibility fallback. Stop old workers, purge only the affected
+application's session records and leases, deploy all workers together, and require
+users to log in again. Do not purge unrelated caches or application data.
+Existing SQL columns hold the new UUID and JSON payload without DDL changes.
+Custom stores and direct record/JWT constructors must adopt the new fields.
+
+Browser logout and local cleanup now attempt `sessionStorage.clear()` in every
+transport/storage mode, including cookie and memory mode. This intentionally
+deletes **all same-origin tab sessionStorage**, including unrelated application
+data. See [cleanup behavior and limits](browser/README.md#api).
+
+### Commands
 
 Run PHP tests and static analysis at the repository root:
 

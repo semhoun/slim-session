@@ -19,7 +19,8 @@ final readonly class SessionRecord
         public int $idleExpiresAt,
         public int $absoluteExpiresAt,
         public string $csrfToken,
-        public int $schemaVersion = 1,
+        public string $verificationSecret,
+        public int $schemaVersion = 2,
     ) {}
 
     public function isExpired(int $now): bool

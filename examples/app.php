@@ -121,7 +121,8 @@ $app->add(function (Request $request, RequestHandlerInterface $handler) use ($co
     $response = $response->withHeader('Vary', 'Origin')->withHeader('Cache-Control', 'no-store');
     if ($allowed !== null) {
         $response = $response->withHeader('Access-Control-Allow-Origin', $allowed)
-            ->withHeader('Access-Control-Expose-Headers', 'X-Session-Token, X-CSRF-Token, X-Session-Token-Expires-At, X-Session-Idle-Expires-At, X-Session-Absolute-Expires-At');
+            ->withHeader('Access-Control-Expose-Headers', ($match[1] === 'cookie' ? 'X-CSRF-Token' : 'X-Session-Token')
+                . ', X-Session-Token-Expires-At, X-Session-Idle-Expires-At, X-Session-Absolute-Expires-At');
         if ($match[1] === 'cookie') { $response = $response->withHeader('Access-Control-Allow-Credentials', 'true'); }
     }
     return $response;

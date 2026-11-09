@@ -25,10 +25,7 @@ abstract class AbstractCache implements CacheInterface
         if ($envelope === null) {
             return $default;
         }
-        $payload = base64_decode(substr($envelope, 64), true);
-        if ($payload === false || !hash_equals($this->signature($key, $payload), substr($envelope, 0, 64))) {
-            throw new StorageUnavailableException('Cache payload authentication failed.');
-        }
+        $payload = $this->verifyEnvelope($key, $envelope);
         try {
             // Object construction is allowed only after authenticating trusted producer bytes.
             return unserialize($payload, ['allowed_classes' => true]);
@@ -99,7 +96,22 @@ abstract class AbstractCache implements CacheInterface
 
     public function has(string $key): bool
     {
-        return $this->readRaw($this->key($key)) !== null;
+        $key = $this->key($key);
+        $envelope = $this->readRaw($key);
+        if ($envelope === null) {
+            return false;
+        }
+        $this->verifyEnvelope($key, $envelope);
+        return true;
+    }
+
+    private function verifyEnvelope(string $key, string $envelope): string
+    {
+        $payload = base64_decode(substr($envelope, 64), true);
+        if ($payload === false || !hash_equals($this->signature($key, $payload), substr($envelope, 0, 64))) {
+            throw new StorageUnavailableException('Cache payload authentication failed.');
+        }
+        return $payload;
     }
 
     abstract protected function readRaw(string $key): ?string;

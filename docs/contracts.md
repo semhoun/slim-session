@@ -8,8 +8,9 @@ PHP sessions, application user models, or global output.
 
 `SessionManager` receives a `Storage\SessionStore`, `SessionConfig`,
 `Psr\Clock\ClockInterface`, and injectable `Random\RandomSource`. The default
-random source uses PHP's cryptographic random generator. Session IDs are
-generated internally; applications must not supply an ID to create a session.
+random source uses PHP's cryptographic random generator. Canonical lowercase
+UUIDv4 session IDs are generated internally with version/variant bits set;
+applications must not supply an ID to create a session.
 
 `SessionConfig` requires an application namespace and accepts idle and absolute
 lifetimes in seconds, lease and acquisition timeout in milliseconds, and JSON
@@ -25,8 +26,10 @@ time. A worker clock cannot grant ownership of an expired database lease.
 `SessionManager::absent()` supplies an unauthenticated context.
 `create(array $data = [])` explicitly creates a session.
 `load(string $id, bool $activity = true)` acquires a lease before loading mutable
-state and rejects missing or expired records. Only trusted, validated session
-IDs should reach `load()` from HTTP authentication.
+state and rejects noncanonical UUIDv4 IDs, missing/expired records, and incompatible
+record schemas. This is a trusted server API, not credential authentication.
+HTTP callers must also verify JWTs and compare their `verificationSecret` against
+the loaded record using `hash_equals`, as `SessionMiddleware` does.
 
 `SessionContext` combines data operations and the request lifecycle:
 
@@ -42,7 +45,7 @@ IDs should reach `load()` from HTTP authentication.
 | `renew()` | Request JWT renewal without marking activity |
 | `renewLease()` | Explicitly renew ownership before its deadline |
 | `excludeActivity()` | Suppress this request's activity update; used by status and refresh |
-| `rotate(bool $preserveData = true)` | Atomically change ID and CSRF proof |
+| `rotate(bool $preserveData = true)` | Atomically change UUID, verification secret, and CSRF proof |
 | `destroy()` | Revoke this session; do not merely clear data |
 | `saveAndClose()` | Persist and release ownership before long work |
 | `discard()` | Release ownership without saving pending changes |
@@ -56,7 +59,11 @@ Backend codecs impose an additional 16 MiB/60-level hard ceiling. Keep configure
 limits within that ceiling; the default 64 KiB/32-level limits are smaller.
 
 An immutable `SessionRecord` includes schema version, revision, data, flash,
-creation/activity times, idle/absolute deadlines, and a separate CSRF proof.
+creation/activity times, idle/absolute deadlines, a CSRF proof, and a required
+independent `verificationSecret`. Its constructor places `verificationSecret`
+after `csrfToken`, before `schemaVersion` (default `2`). Codecs reject schema 1
+and absent or malformed verification secrets. SQL payloads remain JSON; existing
+ID columns accommodate the 36-character UUID without changing table definitions.
 Record deadlines are Unix seconds. `Lease` identifies namespace, session,
 owner, and a fractional Unix-second expiration. Possessing a `Lease` value is
 not proof that storage still recognizes its owner.
@@ -102,6 +109,13 @@ Objects may be cached only when their serialized bytes originate from trusted
 producers. Never use a generic cache as the atomic session store.
 
 ## HTTP Metadata
+
+`JwtService::issue(string $sessionId, int $absoluteExpiresAt, string $verificationSecret)`
+returns a JWT. `issueWithExpiry()` takes the same required arguments and returns
+an `IssuedToken` containing the token and its expiry from one clock snapshot.
+Supply the current committed record's ID, deadline, and secret. Verification
+returns a `VerifiedToken`, including `verificationSecret`; signature verification
+alone is not sufficient to authenticate. Neither API supports legacy credentials.
 
 The status/refresh representation uses Unix-second deadlines:
 

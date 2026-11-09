@@ -3,9 +3,19 @@
 ## Authentication Is Server-Side
 
 A session JWT is a signed reference, not a portable application identity. It
-contains only `sub`, `iss`, `aud`, `iat`, `nbf`, and `exp`. Every authenticated
-request checks server storage. Missing, revoked, idle-expired, and
-absolute-expired records cannot be restored by a valid JWT.
+contains only `sub`, `iss`, `aud`, `iat`, `nbf`, `exp`, `sv`, and `svp`.
+`sub` is a canonical lowercase cryptographic UUIDv4; `sv` is format version 2.
+`svp` is an independently generated 256-bit per-session verification secret,
+encoded as lowercase hex and persisted in the server record. Every authenticated
+request loads live storage under a lease, then uses `hash_equals` to compare the
+record secret before CSRF checks or handler execution. A valid signature and
+known UUID alone cannot authenticate. Missing, revoked, idle-expired, and
+absolute-expired records cannot be restored by a valid JWT. CSRF uses a separate
+random secret; it is never a substitute for `svp`.
+
+JWTs are signed, not encrypted: `svp` is a bearer secret visible to anyone holding
+the JWT. This is not an additional factor against token theft or storage compromise.
+Never expose it through status metadata, logs, or the application data bag.
 
 Applications authenticate users and explicitly create sessions. User lookup,
 authorization, SSO, all-devices logout, and business transactions are outside
@@ -96,8 +106,8 @@ subsequent checks, not previously authorized work or an unchecked open stream.
 Session states are absent, open, closed, and destroyed. Creation is explicit;
 clearing application data does not destroy the session. Closed or destroyed
 contexts do not silently reopen. Rotation requires an open context, creates a
-fresh random ID, invalidates the old ID atomically, and changes the CSRF proof.
-Ordinary JWT renewal does not rotate the ID.
+fresh UUIDv4, invalidates the old ID atomically, and independently changes both
+the verification secret and CSRF proof. Ordinary JWT renewal retains all three.
 
 Normal handler returns commit open sessions, including 4xx responses: a handler
 may intentionally update attempt counters or flash messages. Uncaught handler
@@ -133,3 +143,11 @@ Applications should avoid overlapping login/rotation/logout transitions.
 Local client destruction cancels work and clears local credentials; it is not
 confirmed server revocation. Failed logout must report revocation as
 unconfirmed. The browser client never retries a business mutation automatically.
+Logout, destruction, 401, unauthenticated status, and local expiration attempt
+`sessionStorage.clear()` even in cookie or memory mode. This removes unrelated
+same-origin tab data as well as credentials. Live clients in the same module are
+invalidated; failed clears quarantine all stored-token restoration in that module.
+`persistentCleanupFailed` exposes failure independently of server revocation.
+Inaccessible storage cannot be guaranteed erased; quarantine does not survive a
+reload or span separate module copies/realms. Other tabs and localStorage are not
+cleared, and cookie removal remains server-controlled.

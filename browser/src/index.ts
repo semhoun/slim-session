@@ -44,6 +44,10 @@ export class SessionError extends Error {
 
 const unsafe = (method: string): boolean => !['GET', 'HEAD', 'OPTIONS'].includes(method);
 const deadlineHeaders = ['X-Session-Token-Expires-At', 'X-Session-Idle-Expires-At', 'X-Session-Absolute-Expires-At'] as const;
+let storageQuarantined = false;
+let clearingStorage = false;
+const liveClients = new Set<WeakRef<SessionClient>>();
+const maxTimerDelay = 2_147_483_647;
 
 export class SessionClient {
   private readonly base: URL;
@@ -59,6 +63,8 @@ export class SessionClient {
   private csrf: string | null = null;
   private generation = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private expiryTimer: ReturnType<typeof setTimeout> | undefined;
+  private logoutPromise: Promise<LogoutResult> | undefined;
   private refreshPromise: Promise<SessionState> | undefined;
   private initializePromise: Promise<SessionState> | undefined;
   private refreshFailures = 0;
@@ -92,9 +98,15 @@ export class SessionClient {
     this.storageKey = `slim-session:${encodeURIComponent(options.application)}:${encodeURIComponent(this.base.href)}`;
     if (options.transport === 'header') this.token = options.token ? this.validToken(options.token) : this.readToken();
     if (options.token) this.persistToken();
+    liveClients.add(new WeakRef(this));
   }
 
   get state(): SessionState { return this.current; }
+
+  /** Failed persistent cleanup is independent of server-side revocation. */
+  get persistentCleanupFailed(): boolean {
+    return storageQuarantined;
+  }
 
   /** Listeners receive immutable state, never credentials or CSRF secrets. */
   subscribe(listener: SessionListener): () => void {
@@ -105,6 +117,7 @@ export class SessionClient {
 
   initialize(): Promise<SessionState> {
     this.assertAlive();
+    this.assertNotLoggingOut();
     if (this.initializePromise) return this.initializePromise;
     const task = this.loadStatus();
     this.initializePromise = task;
@@ -115,6 +128,7 @@ export class SessionClient {
   /** Sends once only. A 401 or network failure never replays application work. */
   async request(input: string | URL, init: RequestInit = {}): Promise<Response> {
     this.assertAlive();
+    this.assertNotLoggingOut();
     const url = this.trusted(input);
     const generation = this.generation;
     const response = await this.send(url, init);
@@ -126,6 +140,7 @@ export class SessionClient {
 
   refresh(): Promise<SessionState> {
     this.assertAlive();
+    this.assertNotLoggingOut();
     if (this.refreshPromise) return this.refreshPromise;
     const task = this.refreshSession();
     this.refreshPromise = task;
@@ -134,7 +149,20 @@ export class SessionClient {
   }
 
   /** Always clears local credentials. Only a successful server response confirms revocation. */
-  async logout(): Promise<LogoutResult> {
+  logout(): Promise<LogoutResult> {
+    this.assertAlive();
+    if (this.logoutPromise) return this.logoutPromise;
+    // Install the barrier before cleanup can notify reentrant observers.
+    let resolve!: (result: LogoutResult) => void;
+    let reject!: (reason: unknown) => void;
+    const task = new Promise<LogoutResult>((yes, no) => { resolve = yes; reject = no; });
+    this.logoutPromise = task;
+    void task.finally(() => { if (this.logoutPromise === task) this.logoutPromise = undefined; }).catch(() => {});
+    void this.logoutSession().then(resolve, reject);
+    return task;
+  }
+
+  private async logoutSession(): Promise<LogoutResult> {
     this.assertAlive();
     const token = this.token;
     const csrf = this.csrf;
@@ -142,8 +170,8 @@ export class SessionClient {
     const generation = this.generation;
     this.token = null;
     this.csrf = null;
-    this.persistToken();
-    this.publish('unauthenticated', null, 'unconfirmed');
+    this.clearStorage();
+    if (this.current.status !== 'destroyed') this.publish('unauthenticated', null, 'unconfirmed');
     try {
       const response = await this.send(this.endpoints.logout, { method: 'POST' }, { token, csrf });
       const revoked = response.ok;
@@ -173,6 +201,10 @@ export class SessionClient {
     if (this.current.status === 'destroyed') throw new SessionError('Session client has been destroyed');
   }
 
+  private assertNotLoggingOut(): void {
+    if (this.logoutPromise) throw new SessionError('Session logout is in progress');
+  }
+
   private validToken(token: string): string {
     if (!token || token.length > 16384 || /[\s\x00-\x1f\x7f]/.test(token)) throw new SessionError('Invalid session credential');
     return token;
@@ -196,6 +228,10 @@ export class SessionClient {
   }
 
   private readToken(): string | null {
+    if (this.persistentCleanupFailed) {
+      this.persistToken();
+      return null;
+    }
     try {
       const token = this.storage()?.getItem(this.storageKey);
       return token ? this.validToken(token) : null;
@@ -203,11 +239,43 @@ export class SessionClient {
   }
 
   private persistToken(): void {
+    if (this.options.storage !== 'sessionStorage' || this.options.transport !== 'header') return;
     try {
       const storage = this.storage();
-      if (this.token) storage?.setItem(this.storageKey, this.token);
-      else storage?.removeItem(this.storageKey);
-    } catch { /* Memory remains authoritative if browser storage is unavailable. */ }
+      if (!storage) throw new Error('Session storage is unavailable');
+      // Recovery must remove all stale credentials before writing a new one.
+      if (storageQuarantined) storage.clear();
+      if (this.token) storage.setItem(this.storageKey, this.token);
+      storageQuarantined = false;
+    } catch { storageQuarantined = true; }
+  }
+
+  private clearStorage(): void {
+    if (clearingStorage) return;
+    clearingStorage = true;
+    try {
+      storageQuarantined = true;
+      // Invalidate peers before notifying observers so in-flight responses cannot
+      // repopulate storage cleared by another application/client in this module.
+      const peers: SessionClient[] = [];
+      for (const reference of liveClients) {
+        const peer = reference.deref();
+        if (!peer || peer.current.status === 'destroyed') { liveClients.delete(reference); continue; }
+        if (peer === this) continue;
+        peer.invalidate();
+        peer.token = null;
+        peer.csrf = null;
+        peers.push(peer);
+      }
+      try {
+        if (!globalThis.sessionStorage) throw new Error('Session storage is unavailable');
+        globalThis.sessionStorage.clear();
+        storageQuarantined = false;
+      } catch { /* Exposed through persistentCleanupFailed, including cookie mode. */ }
+      for (const peer of peers) {
+        if (peer.current.status !== 'destroyed') peer.publish('unauthenticated', null);
+      }
+    } finally { clearingStorage = false; }
   }
 
   private async send(url: URL, init: RequestInit, credentials = { token: this.token, csrf: this.csrf }): Promise<Response> {
@@ -347,6 +415,8 @@ export class SessionClient {
     this.generation++;
     clearTimeout(this.timer);
     this.timer = undefined;
+    clearTimeout(this.expiryTimer);
+    this.expiryTimer = undefined;
     for (const controller of this.controllers) controller.abort();
     this.controllers.clear();
     this.refreshPromise = undefined;
@@ -357,26 +427,30 @@ export class SessionClient {
     this.invalidate();
     this.token = null;
     this.csrf = null;
-    this.persistToken();
-    this.publish(status, null);
+    this.clearStorage();
+    if (this.current.status !== 'destroyed') this.publish(status, null);
   }
 
   private schedule(retryDelay?: number): void {
     clearTimeout(this.timer);
+    this.timer = undefined;
+    this.scheduleExpiry();
     const metadata = this.current.metadata;
     if (!metadata || this.current.status !== 'authenticated') return;
     const expiresIn = Math.min(metadata.tokenExpiresAt, metadata.idleExpiresAt, metadata.absoluteExpiresAt) * 1000 - Date.now();
     if (expiresIn <= 0) { this.clear('unauthenticated'); return; }
     const auto = this.options.autoRefresh !== false && this.refreshFailures <= 2;
+    if (!auto) return;
     const refreshIn = Math.max(1000, metadata.tokenExpiresAt * 1000 - Date.now() - (this.options.refreshAheadSeconds ?? 3600) * 1000);
-    const delay = Math.min(expiresIn, auto ? (retryDelay ?? refreshIn) : expiresIn, 2_147_483_647);
+    const refreshDelay = retryDelay ?? refreshIn;
+    const delay = Math.min(expiresIn, refreshDelay, maxTimerDelay);
     this.timer = setTimeout(() => {
       this.timer = undefined;
       if (Math.min(metadata.tokenExpiresAt, metadata.idleExpiresAt, metadata.absoluteExpiresAt) * 1000 <= Date.now()) {
         this.clear('unauthenticated');
         return;
       }
-      if (!auto) { this.schedule(); return; }
+      if (delay < refreshDelay) { this.schedule(refreshDelay - delay); return; }
       const generation = this.generation;
       void this.refresh().catch(() => {
         if (generation !== this.generation || this.current.status !== 'authenticated') return;
@@ -386,6 +460,17 @@ export class SessionClient {
     }, delay);
     // Node consumers should not be kept alive merely by session scheduling.
     (this.timer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  private scheduleExpiry(): void {
+    clearTimeout(this.expiryTimer);
+    this.expiryTimer = undefined;
+    const metadata = this.current.metadata;
+    if (!metadata || this.current.status !== 'authenticated') return;
+    const remaining = Math.min(metadata.tokenExpiresAt, metadata.idleExpiresAt, metadata.absoluteExpiresAt) * 1000 - Date.now();
+    if (remaining <= 0) { this.clear('unauthenticated'); return; }
+    this.expiryTimer = setTimeout(() => this.scheduleExpiry(), Math.min(remaining, maxTimerDelay));
+    (this.expiryTimer as unknown as { unref?: () => void }).unref?.();
   }
 }
 

@@ -17,7 +17,7 @@ final class BackendContractTest extends TestCase
     {
         static $now = null;
         $now ??= time();
-        return new SessionRecord($id, $revision, $data, ['notice' => 'hello'], $now, $now, $idle ?? $now + 60, $now + 300, 'csrf-test');
+        return new SessionRecord($id, $revision, $data, ['notice' => 'hello'], $now, $now, $idle ?? $now + 60, $now + 300, 'csrf-test', str_repeat('a', 64));
     }
 
     #[DataProviderExternal(BackendFactory::class, 'backends')]

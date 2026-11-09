@@ -32,14 +32,16 @@ final readonly class SessionManager
 
     public function load(string $id, bool $activity = true): SessionContext
     {
-        if (!preg_match('/^[a-f0-9]{64}$/D', $id)) {
+        if (!SessionId::valid($id)) {
             throw new SessionNotFoundException('Session is unavailable.');
         }
         $lease = $this->store->acquire($this->config->namespace, $id, bin2hex($this->random->bytes(32)), $this->config->leaseMilliseconds, $this->config->acquisitionTimeoutMilliseconds);
         try {
             // Reload only after acquisition; an earlier read could be stale after waiting.
             $record = $this->store->read($this->config->namespace, $id);
-            if ($record === null || $record->isExpired($this->clock->now()->getTimestamp())) {
+            if ($record === null || $record->id !== $id || $record->schemaVersion !== 2
+                || !preg_match('/\A[a-f0-9]{64}\z/D', $record->verificationSecret)
+                || $record->isExpired($this->clock->now()->getTimestamp())) {
                 throw new SessionNotFoundException('Session is unavailable.');
             }
             return new SessionContext($this->store, $this->config, $this->clock, $this->random, $record, $lease, $activity);

@@ -83,12 +83,38 @@ final class CacheContractTest extends TestCase
         $differentKey = BackendFactory::cache($connection, $ns, str_repeat('different-key', 3));
         $cache->set('object', (object) ['x' => 1]);
         try {
-            $differentKey->get('object');
-            self::fail('Unauthenticated serialized payload was accepted.');
-        } catch (StorageUnavailableException) {
-            self::assertTrue(true);
+            foreach (['get', 'has'] as $method) {
+                try {
+                    $differentKey->$method('object');
+                    self::fail('Unauthenticated serialized payload was accepted.');
+                } catch (StorageUnavailableException) {
+                    self::assertTrue(true);
+                }
+            }
         } finally {
             $cache->clear();
         }
     }
+
+    #[DataProviderExternal(BackendFactory::class, 'backends')]
+    public function testHasAuthenticatesWithoutUnserializing(string $backend): void
+    {
+        $cache = BackendFactory::cache(BackendFactory::connection($backend), 'has_' . bin2hex(random_bytes(8)));
+        CacheWakeupProbe::$wakeups = 0;
+        try {
+            $cache->set('object', new CacheWakeupProbe());
+            self::assertTrue($cache->has('object'));
+            self::assertSame(0, CacheWakeupProbe::$wakeups);
+            self::assertInstanceOf(CacheWakeupProbe::class, $cache->get('object'));
+            self::assertSame(1, CacheWakeupProbe::$wakeups);
+        } finally {
+            $cache->clear();
+        }
+    }
+}
+
+final class CacheWakeupProbe
+{
+    public static int $wakeups = 0;
+    public function __wakeup(): void { ++self::$wakeups; }
 }

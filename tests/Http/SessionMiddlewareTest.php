@@ -41,9 +41,9 @@ final class SessionMiddlewareTest extends TestCase
         $this->factory = new Psr17Factory();
     }
 
-    private function middleware(string $transport = 'header', ?\Closure $activity = null): SessionMiddleware
+    private function middleware(string $transport = 'header', ?\Closure $activity = null, bool $csrfRequired = true, bool $originRequired = true): SessionMiddleware
     {
-        return new SessionMiddleware($this->manager, $this->jwt, new HttpConfig($transport, 'https://example.test'), $this->clock, $this->factory, $activity);
+        return new SessionMiddleware($this->manager, $this->jwt, new HttpConfig($transport, 'https://example.test', csrfRequired: $csrfRequired, originRequired: $originRequired), $this->clock, $this->factory, $activity);
     }
 
     private function handler(\Closure $callback): RequestHandlerInterface
@@ -344,5 +344,128 @@ final class SessionMiddlewareTest extends TestCase
         $handler = new RefreshHandler($this->factory);
         self::assertSame(403, $this->middleware('cookie')->process($request->withAddedHeader('Origin', 'https://example.test'), $handler)->getStatusCode());
         self::assertSame(403, $this->middleware('cookie')->process($request->withAddedHeader('X-CSRF-Token', $csrf), $handler)->getStatusCode());
+    }
+
+    public function testCookieProofChecksAreIndependentAndReleaseLeases(): void
+    {
+        [$id, $token, $csrf] = $this->session();
+        foreach ([true, false] as $csrfRequired) {
+            foreach ([true, false] as $originRequired) {
+                $middleware = $this->middleware('cookie', csrfRequired: $csrfRequired, originRequired: $originRequired);
+                foreach ([null, '', 'null', 'https://foreign.test', ['https://example.test', 'https://example.test'], 'https://example.test'] as $origin) {
+                    foreach ([null, '', 'incorrect', [$csrf, $csrf], $csrf] as $proof) {
+                        $request = new ServerRequest('POST', '/', ['Cookie' => '__Host-slim-session=' . $token]);
+                        if ($origin !== null) {
+                            $request = $request->withHeader('Origin', $origin);
+                        }
+                        if ($proof !== null) {
+                            $request = $request->withHeader('X-CSRF-Token', $proof);
+                        }
+                        $accepted = (!$originRequired || $origin === 'https://example.test') && (!$csrfRequired || $proof === $csrf);
+                        $called = false;
+                        $response = $middleware->process($request, $this->handler(function ($request) use (&$called) {
+                            $called = true;
+                            return (new StatusHandler($this->factory))->handle($request->withMethod('GET'));
+                        }));
+                        self::assertSame($accepted ? 200 : 403, $response->getStatusCode());
+                        self::assertSame($accepted, $called);
+                        self::assertSame('no-store', $response->getHeaderLine('Cache-Control'));
+                        if ($accepted) {
+                            self::assertSame($csrf, $response->getHeaderLine('X-CSRF-Token'));
+                            self::assertSame($csrf, json_decode((string) $response->getBody(), true)['csrfToken']);
+                        }
+                        $loaded = $this->manager->load($id);
+                        $loaded->discard();
+                    }
+                }
+            }
+        }
+    }
+
+    public function testProofOptionsPreserveSafeMethodsAndBearerTransport(): void
+    {
+        [, $token] = $this->session();
+        foreach ([true, false] as $csrfRequired) {
+            foreach ([true, false] as $originRequired) {
+                foreach (['cookie', 'header'] as $transport) {
+                    $middleware = $this->middleware($transport, csrfRequired: $csrfRequired, originRequired: $originRequired);
+                    foreach ($transport === 'cookie' ? ['GET', 'HEAD', 'OPTIONS'] : ['POST', 'PUT', 'PATCH', 'DELETE'] as $method) {
+                        $request = $transport === 'cookie'
+                            ? new ServerRequest($method, '/', ['Cookie' => '__Host-slim-session=' . $token])
+                            : $this->request($token, $method);
+                        $request = $request->withHeader('Origin', ['null', 'https://foreign.test'])->withHeader('X-CSRF-Token', ['invalid', 'invalid']);
+                        self::assertSame(200, $middleware->process($request, $this->handler(fn () => $this->factory->createResponse()))->getStatusCode());
+                    }
+                }
+            }
+        }
+    }
+
+    public function testDisabledProofChecksStillRequireValidStoredSession(): void
+    {
+        $middleware = $this->middleware('cookie', csrfRequired: false, originRequired: false);
+        [$id, $revoked] = $this->session();
+        $context = $this->manager->load($id);
+        $context->destroy();
+        [$id, $expired] = $this->session();
+        $record = $this->store->read('http-test', $id);
+        $wrongProof = $this->jwt->issue($id, $record->absoluteExpiresAt, str_repeat('b', 64));
+        foreach (['forged', $revoked, $wrongProof] as $credential) {
+            self::assertSame(401, $middleware->process(new ServerRequest('POST', '/', ['Cookie' => '__Host-slim-session=' . $credential]), $this->handler(function () {
+                self::fail('A valid JWT and its matching stored record are still required.');
+            }))->getStatusCode());
+        }
+        $this->clock->time += 86401;
+        // A fresh JWT cannot revive a session whose idle deadline has elapsed.
+        $expiredRecord = $this->jwt->issue($id, $record->absoluteExpiresAt, $record->verificationSecret);
+        foreach ([$expired, $expiredRecord] as $credential) {
+            $response = $middleware->process(new ServerRequest('POST', '/', ['Cookie' => '__Host-slim-session=' . $credential]), $this->handler(function () {
+                self::fail('Disabling request proofs must not bypass authentication.');
+            }));
+            self::assertSame(401, $response->getStatusCode());
+        }
+    }
+
+    public function testDisabledProofChecksStillRequireStorageAndReleaseLeaseOnFailure(): void
+    {
+        [$id, $token] = $this->session();
+        $lease = new \Semhoun\SlimSession\Lease('http-test', $id, 'test-owner', 1700000030);
+        $store = $this->createMock(\Semhoun\SlimSession\Storage\SessionStore::class);
+        $store->expects(self::once())->method('acquire')->willReturn($lease);
+        $store->expects(self::once())->method('read')->with('http-test', $id)
+            ->willThrowException(new \Semhoun\SlimSession\Exception\StorageUnavailableException('Unavailable test storage.'));
+        $store->expects(self::once())->method('release')->with($lease);
+        $manager = new SessionManager($store, new SessionConfig('http-test'), $this->clock);
+        $middleware = new SessionMiddleware($manager, $this->jwt, new HttpConfig('cookie', 'https://example.test', csrfRequired: false, originRequired: false), $this->clock, $this->factory);
+        $response = $middleware->process(new ServerRequest('POST', '/', ['Cookie' => '__Host-slim-session=' . $token]), $this->handler(function () {
+            self::fail('A valid JWT must not bypass unavailable storage.');
+        }));
+        self::assertSame(503, $response->getStatusCode());
+        self::assertFalse($response->hasHeader('Set-Cookie'));
+    }
+
+    public function testProofOptionsPreserveExistingConfigurationValidation(): void
+    {
+        $legacy = new HttpConfig('cookie', 'https://example.test', [], '__Host-custom', 'Strict', 'Authorization', 'X-Token', 'X-Proof');
+        self::assertTrue($legacy->csrfRequired);
+        self::assertTrue($legacy->originRequired);
+        foreach ([
+            ['transport' => 'invalid'],
+            ['canonicalOrigin' => 'https://example.test/path'],
+            ['allowedOrigins' => ['null']],
+            ['cookieName' => 'session'],
+            ['sameSite' => 'invalid'],
+            ['sameSite' => 'None'],
+            ['credentialHeader' => 'Bad Header'],
+            ['responseTokenHeader' => 'Bad Header'],
+            ['csrfHeader' => 'Bad Header'],
+        ] as $invalid) {
+            try {
+                new HttpConfig(...array_replace(['transport' => 'cookie', 'canonicalOrigin' => 'https://example.test', 'csrfRequired' => false, 'originRequired' => false], $invalid));
+                self::fail('Disabling proofs must not bypass configuration validation.');
+            } catch (\InvalidArgumentException) {
+                self::assertTrue(true);
+            }
+        }
     }
 }

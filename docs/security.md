@@ -58,16 +58,88 @@ origins and Secure. Third-party cookie restrictions still apply; embedded
 clients should use headers when appropriate. Cookie Max-Age follows the JWT
 deadline. Deletion must use the same cookie name and path.
 
-Cookie-authenticated unsafe requests require both an explicitly allowed Origin
+By default, cookie-authenticated unsafe requests require both an explicitly allowed Origin
 and the session-bound CSRF token in `X-CSRF-Token`. Missing and `null` origins
 fail closed. Bootstrap CSRF using the same-origin status endpoint. Do not
 derive trusted origins from unvalidated Host or forwarded headers. Login and
 session creation need application-level login-CSRF protection before a session
-exists. Business mutations must not use GET.
+exists. Business mutations must not use GET, HEAD, or OPTIONS.
 
 Cookie-mode JavaScript must never receive the JWT. In header mode, prefer
 memory token storage; optional sessionStorage increases exposure to XSS.
 Neither mode protects an application against malicious same-origin scripts.
+
+## Optional Cookie Protection Controls
+
+Use PHP/browser package versions supporting these switches before configuring
+opt-outs. Defaults and existing configurations keep both checks.
+
+PHP `HttpConfig` appends `bool $csrfRequired = true` and
+`bool $originRequired = true` after `csrfHeader`. Existing argument positions and
+secure defaults remain intact. Each flag independently controls one
+check for authenticated cookie requests with methods other than GET, HEAD, OPTIONS:
+
+| `csrfRequired` | `originRequired` | Enforcement |
+| --- | --- | --- |
+| `true` | `true` | Require both the session-bound CSRF token and an allowed Origin |
+| `true` | `false` | Require CSRF only; ignore the request Origin |
+| `false` | `true` | Require an allowed Origin only; ignore the request CSRF header |
+| `false` | `false` | Require neither proof |
+
+An enabled check retains its strict semantics. Missing, empty, duplicate, or
+incorrect CSRF proofs fail; missing, empty, duplicate, `null`, or foreign Origins
+fail. Failure returns 403 before application code runs and releases the session
+lease. A disabled check ignores its corresponding request header, even when
+malformed or duplicated. Safe methods remain exempt; never mutate on these methods.
+Header/Bearer transport already bypasses both checks and remains unchanged.
+
+Use the secure defaults, or explicitly retain both protections:
+
+```php
+use Semhoun\SlimSession\Http\HttpConfig;
+
+$http = new HttpConfig(
+    transport: 'cookie',
+    canonicalOrigin: 'https://app.example.test',
+    allowedOrigins: ['https://app.example.test'],
+    csrfRequired: true,
+    originRequired: true,
+);
+```
+
+The switches apply to every eligible request handled by that middleware
+instance, not individual routes or requests. Disabling either protection weakens
+the defense against cross-site requests. Disabling both permits cookie-authenticated
+mutations without either proof and is an explicit high-risk exception, not a
+recommended configuration. CORS and SameSite cookies are not equivalent replacements.
+Review the entire instance's exposed endpoints before opting out.
+
+Configuration validation remains unchanged: canonical/allowed origins must be
+valid explicit origins, header and cookie names must be valid, and SameSite rules
+still apply. In particular, SameSite=None still requires an explicit nonempty
+allowed-origin list and Secure cookies, even when Origin enforcement is disabled.
+Disabling a request check does not make malformed configuration valid.
+
+CSRF token generation, rotation, storage, response headers, and metadata remain
+unchanged even when checking is disabled. JWT issuance and validation, live storage
+authentication, deadlines, leases, cookies, credential extraction, and transport
+isolation do not change. Missing credentials still do not create a session.
+Applications remain responsible for initial login/session creation and login-CSRF
+protection before an authenticated session exists.
+
+The browser's `SessionClientOptions.csrfRequired?: boolean` defaults to true;
+only explicit `false` disables its bootstrap-token requirement and managed CSRF
+header insertion for cookie mutations, including refresh and logout. Tokens returned
+by the server do not re-enable insertion. There is no browser Origin switch:
+browsers control that header. Keep the browser default when only server Origin
+checking is disabled. Set the browser option to false only where the corresponding
+server CSRF check is disabled; the server may still require an allowed Origin.
+
+A client opt-out never disables server enforcement. An enforcing server still
+returns 403 for missing required proof, with no automatic negotiation or fallback.
+The client never replays failed business mutations; failed logout does not confirm
+server revocation. Deploy supporting packages before opting out, and restore client
+proofs before re-enabling server enforcement. See the [browser options](../browser/README.md#optional-csrf-control).
 
 ## CORS and Response Handling
 

@@ -26,6 +26,7 @@ export interface SessionClientOptions {
   credentialPrefix?: string;
   responseTokenHeader?: string;
   csrfHeader?: string;
+  csrfRequired?: boolean;
   refreshAheadSeconds?: number;
   autoRefresh?: boolean;
   /** Inject a compatible implementation for testing or non-browser runtimes. */
@@ -285,7 +286,7 @@ export class SessionClient {
     }
     const method = (init.method ?? 'GET').toUpperCase();
     if (this.options.transport === 'header' && credentials.token) headers.set(this.credentialHeader, (this.options.credentialPrefix ?? 'Bearer ') + credentials.token);
-    if (this.options.transport === 'cookie' && unsafe(method)) {
+    if (this.options.transport === 'cookie' && this.options.csrfRequired !== false && unsafe(method)) {
       if (!credentials.csrf) throw new SessionError('Initialize the cookie session before sending mutations');
       headers.set(this.csrfHeader, credentials.csrf);
     }

@@ -26,6 +26,10 @@ publication is implied.
   cleanup; Redis uses TTLs.
 - PSR-15 session middleware and status, refresh, and logout handlers with
   explicitly configured HttpOnly cookie or header transport, plus Slim examples.
+- Independent, instance-wide cookie protection options in PHP `HttpConfig`:
+  `csrfRequired = true` and `originRequired = true`. The browser client adds
+  `csrfRequired?: boolean`; only explicit `false` skips the CSRF bootstrap-token
+  requirement and managed header insertion for mutations, refresh, and logout.
 - A framework-independent browser client (`@semhoun/slim-session`) with typed
   ESM and standalone scripts, no runtime dependencies, configurable endpoints,
   state subscriptions, coalesced initialization and refresh, automatic renewal,
@@ -40,8 +44,15 @@ publication is implied.
   signature, issuer, audience, deadlines, and authoritative stored session,
   comparing the proof in constant time. There is no JWT-only fallback.
 - Application namespaces isolate session storage. Cookie-authenticated mutations
-  require an allowed Origin and a session-bound CSRF token; credentials are not
-  accepted from URLs or an inactive transport.
+  require an allowed Origin and a session-bound CSRF token by default; credentials
+  are not accepted from URLs or an inactive transport.
+- Disabling either cookie protection weakens cross-site request defenses;
+  disabling both permits mutations without either proof. CORS and SameSite are
+  not equivalent replacements. Client opt-out does not disable server enforcement:
+  missing required proof still returns 403 without automatic fallback or replay.
+  Header/Bearer behavior, configuration validation, live storage authentication,
+  and CSRF token generation and response metadata remain unchanged. See the
+  [security controls](docs/security.md#optional-cookie-protection-controls).
 - Writes require live lease ownership, an existing record, matching revision,
   and valid deadlines. Stale writes cannot recreate revoked sessions, and writes
   after close are rejected. Session values use JSON rather than PHP object

@@ -18,6 +18,7 @@ const session = createSessionClient({
   application: 'my-app',
   baseUrl: 'https://example.test/api/',
   transport: 'cookie',
+  csrfRequired: true,
   endpoints: {
     status: 'session/status',
     refresh: 'session/refresh',
@@ -106,7 +107,48 @@ Header defaults are `credentialHeader: 'Authorization'`, `credentialPrefix:
 proof headers cannot be overridden per request. Header mode uses `credentials:
 'omit'`; cookie mode uses `credentials: 'include'`, ignores response JWTs, and
 does not override application Authorization headers. Cookie mode requires
-initialize before mutations and forbids JavaScript token storage configuration.
+initialize before mutations by default and forbids JavaScript token storage configuration.
+
+### Optional CSRF Control
+
+`SessionClientOptions.csrfRequired?: boolean` defaults to true. Install supporting
+browser and PHP package versions before opting out. Usage examples retain the
+secure default, either explicitly or by omitting this option.
+
+Only explicit `false` disables the CSRF
+bootstrap-token requirement and automatic managed CSRF header insertion for cookie
+mutations. This applies instance-wide to `request()`, `refresh()`, and `logout()`,
+not individual routes or requests. A returned CSRF token does not re-enable header
+insertion. `initialize()` remains available to fetch authoritative session
+status; an opt-out does not authenticate the client or create a session.
+
+There is no browser `originRequired` option: browsers control Origin. PHP's
+trailing `bool $csrfRequired = true` and `bool $originRequired = true` parameters
+independently control server enforcement. Keep browser CSRF enabled when only
+the server Origin check is disabled. Set browser `csrfRequired: false` only when
+the corresponding server CSRF check is disabled. A client opt-out does not disable
+server enforcement: an enforcing server still returns 403 for missing required
+proof. There is no automatic negotiation, fallback, or replay of business requests.
+A rejected logout still reports revocation as unconfirmed. Restore client proofs
+before re-enabling server enforcement.
+
+Trusted-origin/path restrictions, redirect refusal, generation/lifecycle checks,
+configuration validation, and the prohibition on caller-supplied managed proof
+headers remain unchanged. Cookie requests still use `credentials:
+'include'`; header/Bearer transport remains unchanged with `credentials: 'omit'`.
+Server CSRF token generation, rotation, storage, response headers, and metadata
+continue even when enforcement is disabled. JWT issuance, authentication, and live
+storage/deadline validation remain unchanged.
+
+Disabling either server check weakens cross-site request defenses. Disabling both
+permits cookie-authenticated mutations without either proof; CORS and SameSite are
+not equivalent replacements. Initial login/session creation and login-CSRF
+protection remain application responsibilities. GET, HEAD, and OPTIONS remain
+exempt from these checks and must never mutate business state. Review the
+[four server combinations and risks](../docs/security.md#optional-cookie-protection-controls)
+before configuring an exception.
+
+### Storage and Refresh
 
 Header credentials default to memory. Optional `storage: 'sessionStorage'`
 persists only the credential, namespaced by application and base origin/path.
@@ -187,8 +229,9 @@ from rotation, never as authentication proof or a deadline source. Server
 validation remains authoritative, including when the browser applies a late
 Set-Cookie response outside the client's control.
 
-The server must enforce origins, CSRF, deadlines, and storage validation on every
-authenticated request. Configure explicit CORS origins, permitted request headers,
+The server must enforce deadlines and storage validation on every authenticated
+request, plus the enabled Origin and CSRF checks on cookie mutations (both enabled
+by default). Configure explicit CORS origins, permitted request headers,
 exposed metadata headers, and `Vary: Origin`. Never use wildcard origins with
 credentials. Third-party cookie restrictions remain browser policy; use explicit
 header transport for affected widgets. The client is not a CORS middleware.

@@ -90,6 +90,105 @@ describe('transport and scope', () => {
   });
 });
 
+describe('optional cookie CSRF', () => {
+  it.each([undefined, true])('requires bootstrap for mutations unless explicitly disabled (csrfRequired=%s)', async csrfRequired => {
+    const fetcher = vi.fn<typeof fetch>();
+    const instance = client(fetcher, { transport: 'cookie', ...(csrfRequired === undefined ? {} : { csrfRequired }) });
+    await expect(instance.request('data', { method: 'POST' })).rejects.toThrow('Initialize');
+    await expect(instance.refresh()).rejects.toThrow('Initialize');
+    expect(await instance.logout()).toEqual({ revoked: false });
+    expect(instance.state.revocation).toBe('unconfirmed');
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each(['GET', 'HEAD', 'OPTIONS'])('preserves the default safe-method exemption for %s', async method => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response());
+    await client(fetcher, { transport: 'cookie' }).request('data', { method });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).has('X-CSRF-Token')).toBe(false);
+  });
+
+  it.each(['request', 'refresh', 'logout'] as const)('sends cookie %s without bootstrap when disabled', async operation => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(status('cookie'));
+    const instance = client(fetcher, { transport: 'cookie', csrfRequired: false });
+    expect(fetcher).not.toHaveBeenCalled();
+    if (operation === 'request') await instance.request('data', { method: 'POST', credentials: 'omit', redirect: 'follow' });
+    else if (operation === 'refresh') expect((await instance.refresh()).status).toBe('authenticated');
+    else {
+      expect(await instance.logout()).toEqual({ revoked: true });
+      expect(instance.state).toMatchObject({ status: 'unauthenticated', revocation: 'confirmed' });
+    }
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.lastCall?.[0]).toBe(`https://api.example.test/app/${operation === 'request' ? 'data' : `session/${operation}`}`);
+    const init = fetcher.mock.lastCall?.[1];
+    expect(init).toMatchObject({ method: 'POST', credentials: 'include', redirect: 'error', cache: 'no-store', referrerPolicy: 'no-referrer' });
+    expect(new Headers(init?.headers).has('X-CSRF-Token')).toBe(false);
+    expect(new Headers(init?.headers).has('Authorization')).toBe(false);
+  });
+
+  it('does not re-enable insertion after receiving CSRF in status, response headers, or refresh', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(status('cookie'))
+      .mockResolvedValueOnce(new Response(null, { headers: metadataHeaders(undefined, 'csrf-two') }))
+      .mockResolvedValueOnce(status('cookie', undefined, 'csrf-three'))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const instance = client(fetcher, { transport: 'cookie', csrfRequired: false });
+    await instance.initialize();
+    await instance.request('data', { method: 'PATCH' });
+    await instance.refresh();
+    expect(await instance.logout()).toEqual({ revoked: true });
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    for (const [, init] of fetcher.mock.calls) {
+      expect(init?.credentials).toBe('include');
+      expect(new Headers(init?.headers).has('X-CSRF-Token')).toBe(false);
+    }
+  });
+
+  it.each(['X-CSRF-Token', 'X-Custom-CSRF'])('still reserves the configured proof header %s when disabled', async csrfHeader => {
+    const fetcher = vi.fn<typeof fetch>();
+    const instance = client(fetcher, { transport: 'cookie', csrfRequired: false, csrfHeader });
+    await expect(instance.request('data', { method: 'POST', headers: { [csrfHeader.toLowerCase()]: 'caller-proof' } })).rejects.toThrow('managed');
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each(['request', 'refresh', 'logout'] as const)('does not retry or negotiate after cookie %s receives 403', async operation => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 403 }));
+    const instance = client(fetcher, { transport: 'cookie', csrfRequired: false });
+    if (operation === 'request') expect((await instance.request('data', { method: 'POST', body: 'change' })).status).toBe(403);
+    else if (operation === 'refresh') await expect(instance.refresh()).rejects.toMatchObject({ status: 403 });
+    else {
+      expect(await instance.logout()).toEqual({ revoked: false });
+      expect(instance.state).toMatchObject({ status: 'unauthenticated', revocation: 'unconfirmed' });
+    }
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).has('X-CSRF-Token')).toBe(false);
+  });
+
+  it('reports network logout failure as unconfirmed even without CSRF enforcement', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockRejectedValue(new TypeError('offline'));
+    const instance = client(fetcher, { transport: 'cookie', csrfRequired: false });
+    expect(await instance.logout()).toEqual({ revoked: false });
+    expect(instance.state).toMatchObject({ status: 'unauthenticated', revocation: 'unconfirmed' });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.lastCall?.[1]?.credentials).toBe('include');
+  });
+
+  it.each([undefined, true, false])('leaves Bearer request, refresh, and logout unchanged (csrfRequired=%s)', async csrfRequired => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => status());
+    const instance = client(fetcher, csrfRequired === undefined ? {} : { csrfRequired });
+    await expect(instance.request('data', { method: 'POST', headers: { 'X-CSRF-Token': 'caller-proof' } })).rejects.toThrow('managed');
+    await expect(instance.request('data', { headers: { Authorization: 'caller-token' } })).rejects.toThrow('managed');
+    await instance.request('data', { method: 'POST', credentials: 'include' });
+    await instance.refresh();
+    expect(await instance.logout()).toEqual({ revoked: true });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    for (const [, init] of fetcher.mock.calls) {
+      expect(init?.credentials).toBe('omit');
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer initial');
+      expect(new Headers(init?.headers).has('X-CSRF-Token')).toBe(false);
+    }
+  });
+});
+
 describe('lifecycle and concurrency', () => {
   it.each([
     ['header', 'before'], ['header', 'after'], ['cookie', 'before'], ['cookie', 'after'],

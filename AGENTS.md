@@ -25,7 +25,7 @@ PHP code lives in `src/`; browser code lives in `browser/`.
 ## Security and Concurrency
 
 - Preserve application namespaces, issuer/audience checks, signature validation, and strict deadlines.
-- Protect cookie-authenticated mutations with origin validation and session-bound CSRF tokens.
+- Protect cookie-authenticated mutations with Origin validation and session-bound CSRF tokens by default; permit only explicitly configured, instance-wide independent opt-outs as described in [security controls](docs/security.md#optional-cookie-protection-controls).
 - Require lease ownership, record existence, and revision checks for writes. Never upsert a stale session.
 - Release locks on every exit path. Close the session before streaming or long-running work.
 - Reject writes after lease loss or session close. Never replay business mutations automatically.

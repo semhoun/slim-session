@@ -52,7 +52,7 @@ self-hosted standalone scripts for plain HTML.
 - Create sessions explicitly after application authentication. Missing credentials never create a session automatically.
 - Configure exactly one transport per integration: HttpOnly cookie or HTTP header. Inactive transports are not fallback authentication paths.
 - Supply an independent namespace, issuer, audience, signing key, canonical origin, and cookie name for each application.
-- Cookie mutations require an allowed Origin and a session-bound CSRF header. Business mutations must not use GET.
+- Cookie mutations require an allowed Origin and a session-bound CSRF header by default. Explicit instance-wide opt-outs are described below. Never mutate on GET, HEAD, or OPTIONS.
 - Server writes require a live lease, existing record, matching revision, and unexpired deadlines. Saves never upsert missing records.
 - Close sessions before streaming or long work. A session lease does not make application side effects transactional.
 - Local browser cleanup is not server logout. Failed logout reports revocation as unconfirmed.
@@ -66,6 +66,42 @@ See [security and lifecycle boundaries](docs/security.md) before integration.
 The [PHP contracts](docs/contracts.md) describe the lifecycle and atomic store
 interfaces. The [examples](examples/README.md) explain isolated setup and
 application-owned routing.
+
+### Optional Cookie Protections
+
+Install package versions supporting these switches before configuring an opt-out.
+Existing configurations retain both checks.
+
+PHP `HttpConfig` adds trailing `bool $csrfRequired = true` and
+`bool $originRequired = true` parameters, preserving existing argument positions.
+For authenticated cookie requests other than GET, HEAD, and OPTIONS:
+
+| `csrfRequired` | `originRequired` | Required proof |
+| --- | --- | --- |
+| `true` | `true` | Session-bound CSRF header and allowed Origin (secure default) |
+| `true` | `false` | Session-bound CSRF header only |
+| `false` | `true` | Allowed Origin only |
+| `false` | `false` | Neither proof; explicit high-risk opt-out |
+
+These are middleware-instance settings, not per-route or per-request exemptions.
+Header/Bearer transport remains unchanged and bypasses these cookie checks.
+Disabling a check does not relax configuration validation, authentication, live
+storage validation, or deadlines. CSRF token generation, rotation, storage, response
+headers, and metadata remain unchanged, even with enforcement disabled.
+
+The browser option `csrfRequired?: boolean` defaults to true; only explicit
+`false` skips the managed CSRF header and bootstrap-token requirement for
+cookie mutations, including refresh and logout. There is no browser Origin switch.
+Keep client and server aligned: a client opt-out cannot disable server enforcement,
+and a missing required proof still produces 403 without automatic fallback or
+business-request replay. Restore client proofs before re-enabling server enforcement.
+
+Keep both protections enabled unless an application-specific security review
+justifies an exception. Disabling either weakens protection; disabling both permits
+cookie-authenticated mutations without either proof. CORS and SameSite are not
+equivalent replacements. Initial login/session creation and login-CSRF protection
+remain application responsibilities. See the [security guide](docs/security.md#optional-cookie-protection-controls)
+and [browser options](browser/README.md#optional-csrf-control) for details.
 
 ## Local Filesystem Backend
 

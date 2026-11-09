@@ -117,8 +117,8 @@ final class SessionMiddleware implements MiddlewareInterface
         }
         $origins = $request->getHeader('Origin');
         $csrf = $request->getHeader($this->config->csrfHeader);
-        if (count($origins) !== 1 || !in_array($origins[0], [$this->config->canonicalOrigin, ...$this->config->allowedOrigins], true)
-            || count($csrf) !== 1 || !hash_equals($context->record()->csrfToken ?? '', $csrf[0]) || $csrf[0] === '') {
+        if (($this->config->originRequired && (count($origins) !== 1 || !in_array($origins[0], [$this->config->canonicalOrigin, ...$this->config->allowedOrigins], true)))
+            || ($this->config->csrfRequired && (count($csrf) !== 1 || !hash_equals($context->record()->csrfToken ?? '', $csrf[0]) || $csrf[0] === ''))) {
             throw new HttpSessionException(403, 'Invalid origin or CSRF proof.');
         }
     }

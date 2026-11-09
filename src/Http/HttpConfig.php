@@ -15,6 +15,8 @@ final readonly class HttpConfig
         public string $credentialHeader = 'Authorization',
         public string $responseTokenHeader = 'X-Session-Token',
         public string $csrfHeader = 'X-CSRF-Token',
+        public bool $csrfRequired = true,
+        public bool $originRequired = true,
     ) {
         if (!in_array($transport, ['cookie', 'header'], true) || !in_array($sameSite, ['Lax', 'Strict', 'None'], true)
             || !preg_match('/^__Host-[A-Za-z0-9_-]+$/D', $cookieName)) {

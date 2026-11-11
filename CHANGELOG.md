@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.0.1] - 2026-11-11
+
+### Added
+
+- Bound a new session to a server-calculated expiration with the optional
+  `absoluteExpiresAt` argument on `SessionContext::create()` and
+  `SessionManager::create()`. The bound can shorten, never extend, the configured
+  maximum lifetime and is checked after lease acquisition.
+- Start a fresh authentication with `SessionContext::startNew()` without
+  replacing the context tracked by the middleware. It revokes the previous
+  session and generates fresh identity, secrets, and deadlines, without retaining
+  old application data or flash messages.
+- Read the authenticated incoming credential's transport and expiration through
+  `SessionGuard::admission($request)`, without exposing its JWT or secrets.
+  This metadata remains separate from any credential renewed in the response.
+
+### Fixed
+
+- Browser logout, teardown, and local expiration no longer erase unrelated
+  same-origin tab data or invalidate independent clients. Persistent header
+  clients remove only their own application/base-URL credential key; memory and
+  cookie clients never access browser storage.
+- Storage failures quarantine only the affected credential key. Recovery no
+  longer clears storage belonging to other applications or clients.
+
+### Security
+
+- Failed session creation or replacement cannot issue a new credential after
+  a caught save, lease-renewal, or rotation failure. Replacement failures after
+  revocation never restore the old identity. Session replacement is not atomic;
+  applications must not automatically replay business operations on failure.
+
 ## [1.0.0] - 2026-11-09
 
 Initial release notes. The date above is proposed; no release tag or package

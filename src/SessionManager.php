@@ -23,10 +23,10 @@ final readonly class SessionManager
     }
 
     /** @param array<string, mixed> $data */
-    public function create(array $data = []): SessionContext
+    public function create(array $data = [], ?int $absoluteExpiresAt = null): SessionContext
     {
         $context = $this->absent();
-        $context->create($data);
+        $context->create($data, $absoluteExpiresAt);
         return $context;
     }
 

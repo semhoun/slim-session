@@ -67,6 +67,13 @@ The [PHP contracts](docs/contracts.md) describe the lifecycle and atomic store
 interfaces. The [examples](examples/README.md) explain isolated setup and
 application-owned routing.
 
+For reauthentication, use `SessionGuard::context($request)->startNew(...)` rather
+than replacing the PSR-7 context attribute. Creation accepts a server-calculated
+`absoluteExpiresAt` bound; `SessionGuard::admission($request)` exposes only the
+incoming authenticated credential's transport and expiry. See the
+[lifecycle contracts](docs/contracts.md#bounded-creation-and-new-authentication)
+and [admission metadata](docs/contracts.md#incoming-admission-metadata).
+
 ### Optional Cookie Protections
 
 Install package versions supporting these switches before configuring an opt-out.
@@ -243,10 +250,10 @@ users to log in again. Do not purge unrelated caches or application data.
 Existing SQL columns hold the new UUID and JSON payload without DDL changes.
 Custom stores and direct record/JWT constructors must adopt the new fields.
 
-Browser logout and local cleanup now attempt `sessionStorage.clear()` in every
-transport/storage mode, including cookie and memory mode. This intentionally
-deletes **all same-origin tab sessionStorage**, including unrelated application
-data. See [cleanup behavior and limits](browser/README.md#api).
+Browser logout and local cleanup touch only the persistent header client's own
+credential key. Cookie and memory clients never access browser storage, and
+independent clients are not invalidated. See
+[cleanup behavior and limits](browser/README.md#storage-and-refresh).
 
 ### Commands
 

@@ -24,7 +24,7 @@ time. A worker clock cannot grant ownership of an expired database lease.
 ## Lifecycle
 
 `SessionManager::absent()` supplies an unauthenticated context.
-`create(array $data = [])` explicitly creates a session.
+`create(array $data = [], ?int $absoluteExpiresAt = null)` explicitly creates a session.
 `load(string $id, bool $activity = true)` acquires a lease before loading mutable
 state and rejects noncanonical UUIDv4 IDs, missing/expired records, and incompatible
 record schemas. This is a trusted server API, not credential authentication.
@@ -37,7 +37,8 @@ the loaded record using `hash_equals`, as `SessionMiddleware` does.
 | --- | --- |
 | `state()` | Return `Absent`, `Open`, `Closed`, or `Destroyed` |
 | `record()` | Read the current immutable record snapshot |
-| `create(array $data = [])` | Create explicitly from an absent context |
+| `create(array $data = [], ?int $absoluteExpiresAt = null)` | Create explicitly from an absent context |
+| `startNew(array $data = [], ?int $absoluteExpiresAt = null)` | Create from absent, or revoke and replace an open session on the same context |
 | `get()`, `has()`, `set()`, `delete()` | Access application data |
 | `assign()`, `clear()` | Bulk assignment or clear data without revoking |
 | `flash()`, `consumeFlash()` | Store and consume flash values under the lease |
@@ -57,6 +58,34 @@ and flash live outside the application data bag. No serializer hooks or
 application-object deserialization form part of the session contract.
 Backend codecs impose an additional 16 MiB/60-level hard ceiling. Keep configured
 limits within that ceiling; the default 64 KiB/32-level limits are smaller.
+
+### Bounded Creation and New Authentication
+
+Both creation APIs accept an optional server-calculated absolute deadline in Unix
+seconds. After lease acquisition, the effective absolute deadline is the minimum
+of this bound and `now + absoluteLifetime`. The idle deadline is the minimum of
+that result and `now + idleLifetime`. Omitting the bound preserves the configured
+lifetimes. An elapsed bound, including one elapsed during acquisition, throws
+`InvalidSessionStateException` without creating a record or retaining the lease.
+Activity, renewal, and rotation cannot extend the effective absolute deadline.
+Never trust an unvalidated client deadline or freeze the context's clock.
+
+Use the context supplied by the middleware for a new authentication:
+
+```php
+$context = \Semhoun\SlimSession\Http\SessionGuard::context($request);
+$context->startNew(['user_id' => $authenticatedUserId], absoluteExpiresAt: $serverDeadline);
+```
+
+`startNew()` accepts only absent or open contexts, never closed or destroyed
+ones. From open, it revokes the previous identity before allocating a fresh ID,
+verification secret, CSRF proof, creation time, and deadlines. No old data or
+flash is retained. The context object is unchanged, so middleware persistence and
+credential emission continue to track it. Replacement is not atomic: a failure
+after revocation leaves a terminal context, with no new credential to emit and
+no restoration of the old identity. Do not replay business mutations on failure.
+`rotate()` still preserves creation time and the absolute deadline; it is not
+a new authentication. Early `saveAndClose()` remains supported before streaming.
 
 ### Application Data Paths
 
@@ -200,6 +229,34 @@ Header responses use `X-Session-Token` by default. Business responses use
 `X-Session-Token-Expires-At`, `X-Session-Idle-Expires-At`, and
 `X-Session-Absolute-Expires-At`. Cookie responses also return `X-CSRF-Token`.
 Applications own route names, CORS, and preflight processing.
+
+### Incoming Admission Metadata
+
+Inside the session middleware's handler, `Http\SessionGuard::admission($request)`
+returns a readonly `Http\AdmissionMetadata` with `transport` and `expiresAt`
+(Unix seconds), or null when no incoming credential was supplied. Calling the
+guard without session middleware throws `LogicException`. The DTO contains no
+JWT, session ID, verification secret, or CSRF proof.
+
+The middleware sets `SessionGuard::ADMISSION_ATTRIBUTE` only after JWT signature,
+issuer, audience, and time validation, authoritative session loading, constant-time
+verification-secret comparison, and applicable cookie request proofs. It
+overwrites any previous value, including with null for absent requests. Invalid
+credentials, revoked/expired records, or unavailable storage never reach the
+handler with authenticated metadata.
+
+`expiresAt` describes the incoming verified JWT, not a credential renewed in the
+response. It remains unchanged if the handler creates, replaces, or destroys a
+session. Use current server-session state as well when bounding capabilities;
+revalidate that session when the capability is used. The DTO is a request-local
+authentication result, not a credential. An immutable object or an attribute's
+presence alone does not prove provenance: consume only the value delivered by
+the middleware on the current request, never a client-supplied or copied DTO.
+
+HTTP finalization remains middleware-owned. An HTML callback needing a header
+credential in its body must use an application-owned one-time exchange or another
+explicit integration. There is no shared commit-result API; calling JWT issuance
+directly does not provide idempotent middleware finalization guarantees.
 
 The PHP middleware requires `Bearer <JWT>` in the configured credential header,
 even when its name is changed from `Authorization`. Keep the browser's default

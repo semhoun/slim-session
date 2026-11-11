@@ -52,7 +52,10 @@ final class SessionMiddleware implements MiddlewareInterface
             if ($token !== null && $token->expiresAt - $this->clock->now()->getTimestamp() <= $this->jwt->renewalWindow) {
                 $context->renew();
             }
-            $response = $handler->handle($request->withAttribute(SessionGuard::ATTRIBUTE, $context));
+            $admission = $token === null ? null : new AdmissionMetadata($this->config->transport, $token->expiresAt);
+            $response = $handler->handle($request
+                ->withAttribute(SessionGuard::ATTRIBUTE, $context)
+                ->withAttribute(SessionGuard::ADMISSION_ATTRIBUTE, $admission));
             if ($context->state() === SessionState::Open) {
                 $context->saveAndClose();
             }

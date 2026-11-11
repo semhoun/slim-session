@@ -89,10 +89,10 @@ explicit API origin and `script-src` for your self-hosted external scripts.
 - `request(url, init?)` sends exactly one request and returns the original Response. It never refreshes and retries application work, including GET. Caller cancellation through `init.signal` is supported. HTTP errors are returned, not automatically thrown.
 - `refresh()` sends POST and coalesces concurrent refresh calls. Invalid or expired credentials cannot recover themselves.
 - `logout()` sends POST, always clears in-memory credentials, and returns `{revoked:boolean}`. Concurrent calls coalesce. Until it settles, `initialize()` and `refresh()` throw `SessionError`, and `request()` rejects with it. Only a successful HTTP response confirms revocation; network, CSRF, and server failures report false. Browser storage cleanup failures do not change this server result.
-- `destroy()` aborts client-owned requests, clears in-memory credentials and timers, attempts full tab sessionStorage clearing, notifies subscribers once, and removes listeners. It does not revoke the server session. Later operations throw.
+- `destroy()` aborts client-owned requests, clears in-memory credentials and timers, removes only its own persisted credential when configured, notifies subscribers once, and removes listeners. It does not revoke the server session. Later operations throw.
 - `subscribe(listener)` returns an unsubscribe function. Notifications contain immutable state without JWT or CSRF secrets. Observer exceptions cannot interrupt cleanup.
 - `state` has `status` (`uninitialized`, `authenticated`, `unauthenticated`, `destroyed`), `metadata` (deadlines or null), and `revocation` (`none`, `confirmed`, `unconfirmed`). Authentication state describes the last server check, not a business permission.
-- `persistentCleanupFailed` reports module-wide sessionStorage quarantine after a failed clear or write, including in cookie/memory mode. It is independent of `state.revocation` and remains readable after destroy; successful recovery resets it for all clients.
+- `persistentCleanupFailed` reports quarantine of this client's sessionStorage key after a failed removal or write. It is always false in cookie/memory mode, is independent of `state.revocation`, and remains readable after destroy. Successful recovery resets it only for clients using the same persisted key.
 
 Required options are `application`, `baseUrl`, `transport`, and `endpoints`.
 `baseUrl` must be an absolute HTTP(S) URL without credentials, query, or fragment;
@@ -157,29 +157,31 @@ applications or base paths are isolated. Identically configured clients share th
 same persisted slot; use separate application identifiers for independent scopes.
 Storage is not an XSS defense. Do not persist credentials in localStorage.
 
-**Cleanup is deliberately not namespaced.** Logout, destroy, 401, unauthenticated
-status, and local expiration call `sessionStorage.clear()` in all modes, including
-cookie and memory mode. This erases all data in the current page origin's tab
-sessionStorage, including unrelated drafts and other applications' credentials.
-The scope is the page origin, not the configured API origin. It does not erase
-localStorage, other tabs, or HttpOnly cookies. Cookie cleanup still needs server
-logout to confirm revocation.
+Memory-backed and cookie clients never access browser storage, including during
+logout, destroy, 401, unauthenticated status, or local expiration. Persistent header
+clients remove only their own key on these paths. Cleanup and quarantine recovery
+never call `sessionStorage.clear()` or enumerate other keys; host data and credentials
+for other applications or base URLs remain untouched.
 
-Cleanup invalidates other live clients sharing this module, clears their in-memory
-credentials and timers, aborts their requests, and rejects/ignores late responses.
-Failed clearing (including inaccessible storage) quarantines all stored-token
-restoration across the module. A new persistent client retries a full clear and
-starts without a restored credential even if recovery succeeds. An explicitly
-supplied new token remains usable in memory, but cannot persist until clear
-succeeds. Failed writes also quarantine potentially stale storage. Normal token
-writes never clear unrelated data unless recovering a quarantine.
+Failed removal (including inaccessible storage) or writes quarantine only the
+affected key within this module. A new persistent client using that key retries
+removal and starts without a restored credential even if recovery succeeds. An
+explicitly supplied new token remains usable in memory, but cannot persist until
+the quarantined key can be removed and the write succeeds. Recovery never removes
+another key. Cookie/memory clients do not participate in quarantine.
 
-These protections are not durable across reloads, separate realms, or separate
-package copies; independent scripts can also write new data after clearing.
-Storage cannot be guaranteed erased when inaccessible. Check
-`persistentCleanupFailed` separately from server revocation. Confirmed server
-revocation remains essential, and cleanup of other clients does not revoke their
-server sessions. Reauthenticate affected clients explicitly.
+Clients do not invalidate or abort one another. Each client's lifecycle checks
+prevent its own late responses from restoring credentials after logout, teardown,
+or expiration. Identically configured persistent clients share a slot, not a
+coordinated lifecycle: another active instance may write that slot again. Use
+distinct application identifiers for independent sessions and explicitly coordinate
+clients if they must share logout behavior.
+
+Quarantine is not durable across reloads, separate realms, or separate package
+copies. Storage cannot be guaranteed erased when inaccessible. Check
+`persistentCleanupFailed` separately from server revocation. Local cleanup does not
+erase HttpOnly cookies or revoke server sessions; confirmed server revocation
+remains essential.
 
 `autoRefresh` defaults to true. `refreshAheadSeconds` defaults to 3600. Scheduling
 uses server-provided Unix-second expiration metadata; it never parses the JWT.

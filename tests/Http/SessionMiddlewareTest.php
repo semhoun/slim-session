@@ -11,6 +11,7 @@ use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\RequestHandlerInterface;
 use Semhoun\SlimSession\Http\HttpConfig;
+use Semhoun\SlimSession\Http\AdmissionMetadata;
 use Semhoun\SlimSession\Http\LogoutHandler;
 use Semhoun\SlimSession\Http\RefreshHandler;
 use Semhoun\SlimSession\Http\SessionGuard;
@@ -141,6 +142,170 @@ final class SessionMiddlewareTest extends TestCase
         self::assertSame((string) $token->expiresAt, $response->getHeaderLine('X-Session-Token-Expires-At'));
         self::assertTrue($this->store->read('http-test', $token->sessionId)->data['saved']);
         self::assertSame('no-store', $response->getHeaderLine('Cache-Control'));
+    }
+
+    public function testAdmissionDescribesIncomingCredentialEvenWhenResponseRenewsIt(): void
+    {
+        foreach (['header', 'cookie'] as $transport) {
+            [, $token] = $this->session();
+            $expiry = $this->jwt->verify($token)->expiresAt;
+            $this->clock->time = $expiry - 10;
+            $request = $transport === 'header' ? $this->request($token)
+                : new ServerRequest('GET', '/', ['Cookie' => '__Host-slim-session=' . $token]);
+            $admission = null;
+            $response = $this->middleware($transport)->process($request, $this->handler(function ($request) use ($transport, $expiry, &$admission) {
+                $admission = SessionGuard::admission($request);
+                self::assertInstanceOf(AdmissionMetadata::class, $admission);
+                self::assertSame($transport, $admission->transport);
+                self::assertSame($expiry, $admission->expiresAt);
+                self::assertSame(['transport', 'expiresAt'], array_keys(get_object_vars($admission)));
+                return $this->factory->createResponse();
+            }));
+            self::assertSame(200, $response->getStatusCode());
+            self::assertGreaterThan($admission->expiresAt, (int) $response->getHeaderLine('X-Session-Token-Expires-At'));
+            self::assertSame($expiry, $admission->expiresAt);
+        }
+    }
+
+    public function testAbsentRequestOverwritesInjectedAdmissionAndCreationDoesNotInventOne(): void
+    {
+        $request = (new ServerRequest('POST', '/login'))
+            ->withAttribute(SessionGuard::ADMISSION_ATTRIBUTE, new AdmissionMetadata('header', PHP_INT_MAX));
+        $response = $this->middleware()->process($request, $this->handler(function ($request) {
+            self::assertNull(SessionGuard::admission($request));
+            SessionGuard::context($request)->create();
+            self::assertNull(SessionGuard::admission($request));
+            return $this->factory->createResponse();
+        }));
+        self::assertSame(200, $response->getStatusCode());
+        self::assertNotSame('', $response->getHeaderLine('X-Session-Token'));
+    }
+
+    public function testInjectedAdmissionCannotBypassCredentialOrRecordValidation(): void
+    {
+        [$id, $token] = $this->session();
+        $record = $this->store->read('http-test', $id);
+        $foreignAudience = new JwtService($this->clock, 'http-test', 'foreign', ['current' => str_repeat('a', 32)], 'current');
+        $foreignIssuer = new JwtService($this->clock, 'foreign', 'http-test', ['current' => str_repeat('a', 32)], 'current');
+        $wrongKey = new JwtService($this->clock, 'http-test', 'http-test', ['current' => str_repeat('b', 32)], 'current');
+        $credentials = ['invalid', $foreignAudience->issue($id, $record->absoluteExpiresAt, $record->verificationSecret),
+            $foreignIssuer->issue($id, $record->absoluteExpiresAt, $record->verificationSecret),
+            $wrongKey->issue($id, $record->absoluteExpiresAt, $record->verificationSecret),
+            $this->jwt->issue($id, $record->absoluteExpiresAt, str_repeat('b', 64))];
+        foreach ($credentials as $credential) {
+            $request = $this->request($credential)->withAttribute(SessionGuard::ADMISSION_ATTRIBUTE, new AdmissionMetadata('header', PHP_INT_MAX));
+            $response = $this->middleware()->process($request, $this->handler(function () {
+                self::fail('Injected metadata cannot authenticate a request.');
+            }));
+            self::assertSame(401, $response->getStatusCode());
+            self::assertFalse($response->hasHeader('X-Session-Token'));
+        }
+        $this->clock->time += 86400;
+        $expiredRecordToken = $this->jwt->issue($id, $record->absoluteExpiresAt, $record->verificationSecret);
+        foreach ([$token, $expiredRecordToken] as $credential) {
+            self::assertSame(401, $this->middleware()->process($this->request($credential), $this->handler(function () {
+                self::fail('Expired credentials or server sessions cannot supply admission metadata.');
+            }))->getStatusCode());
+        }
+        $context = $this->manager->create();
+        $record = $context->record();
+        $revoked = $this->jwt->issue($record->id, $record->absoluteExpiresAt, $record->verificationSecret);
+        $context->destroy();
+        self::assertSame(401, $this->middleware()->process($this->request($revoked), $this->handler(function () {
+            self::fail('Revoked sessions cannot supply admission metadata.');
+        }))->getStatusCode());
+    }
+
+    public function testNewAuthenticationFinalizesSameContextAndRejectsOldCredential(): void
+    {
+        foreach ([['header', false], ['header', true], ['cookie', false], ['cookie', true]] as [$transport, $earlyClose]) {
+            [$id, $token, $csrf] = $this->session();
+            $old = $this->store->read('http-test', $id);
+            $this->clock->time += 10;
+            $request = $transport === 'header' ? $this->request($token, 'POST')
+                : new ServerRequest('POST', '/', ['Cookie' => '__Host-slim-session=' . $token,
+                    'Origin' => 'https://example.test', 'X-CSRF-Token' => $csrf]);
+            $response = $this->middleware($transport)->process($request, $this->handler(function ($request) use ($earlyClose) {
+                $context = SessionGuard::requireSession($request);
+                $context->startNew(['identity' => 456], absoluteExpiresAt: $this->clock->time + 100);
+                self::assertSame($context, SessionGuard::context($request));
+                self::assertNotNull(SessionGuard::admission($request));
+                if ($earlyClose) { $context->saveAndClose(); }
+                return $this->factory->createResponse();
+            }));
+            self::assertSame(200, $response->getStatusCode());
+            $encoded = $response->getHeaderLine('X-Session-Token');
+            if ($transport === 'cookie') {
+                self::assertSame('', $encoded);
+                $encoded = explode(';', substr($response->getHeaderLine('Set-Cookie'), strlen('__Host-slim-session=')))[0];
+            }
+            $verified = $this->jwt->verify($encoded);
+            self::assertNotSame($id, $verified->sessionId);
+            self::assertSame($this->clock->time + 100, $verified->expiresAt);
+            $new = $this->store->read('http-test', $verified->sessionId);
+            self::assertSame(['identity' => 456], $new->data);
+            self::assertNotSame($old->verificationSecret, $new->verificationSecret);
+            self::assertNull($this->store->read('http-test', $id));
+            self::assertSame(401, $this->middleware()->process($this->request($token), new StatusHandler($this->factory))->getStatusCode());
+        }
+    }
+
+    public function testReplacementSaveFailureNeverEmitsNewCredential(): void
+    {
+        [$id, $token] = $this->session();
+        $response = $this->middleware()->process($this->request($token), $this->handler(function ($request) {
+            SessionGuard::requireSession($request)->startNew();
+            $this->clock->time += 31;
+            return $this->factory->createResponse();
+        }));
+        self::assertSame(409, $response->getStatusCode());
+        self::assertNull($this->store->read('http-test', $id));
+        self::assertFalse($response->hasHeader('X-Session-Token'));
+        self::assertFalse($response->hasHeader('Set-Cookie'));
+    }
+
+    public function testCaughtReplacementCreationFailureStillFinalizesUnauthenticated(): void
+    {
+        [$id, $token] = $this->session();
+        $store = $this->createMock(\Semhoun\SlimSession\Storage\SessionStore::class);
+        $store->method('acquire')->willReturnCallback(fn (...$args) => $this->store->acquire(...$args));
+        $store->method('read')->willReturnCallback(fn (...$args) => $this->store->read(...$args));
+        $store->method('revoke')->willReturnCallback(fn (...$args) => $this->store->revoke(...$args));
+        $store->method('release')->willReturnCallback(fn (...$args) => $this->store->release(...$args));
+        $store->method('create')->willThrowException(new \Semhoun\SlimSession\Exception\StorageUnavailableException('Test creation failure.'));
+        $manager = new SessionManager($store, new SessionConfig('http-test'), $this->clock);
+        $middleware = new SessionMiddleware($manager, $this->jwt, new HttpConfig('header', 'https://example.test'), $this->clock, $this->factory);
+        $response = $middleware->process($this->request($token), $this->handler(function ($request) {
+            try {
+                SessionGuard::requireSession($request)->startNew();
+                self::fail('Creation must fail.');
+            } catch (\Semhoun\SlimSession\Exception\StorageUnavailableException) {
+                return (new StatusHandler($this->factory))->handle($request);
+            }
+        }));
+        self::assertSame(['authenticated' => false, 'transport' => 'header'], json_decode((string) $response->getBody(), true));
+        self::assertFalse($response->hasHeader('X-Session-Token'));
+        self::assertNull($this->store->read('http-test', $id));
+    }
+
+    public function testCaughtReplacementLeaseLossNeverEmitsCredential(): void
+    {
+        [$id, $token] = $this->session();
+        $response = $this->middleware()->process($this->request($token, 'POST'), $this->handler(function ($request) {
+            $context = SessionGuard::requireSession($request);
+            $context->startNew(['identity' => 456]);
+            $context->set('unsaved', true);
+            $this->clock->time += 31;
+            try {
+                $context->renewLease();
+                self::fail('Lease renewal must fail.');
+            } catch (\Semhoun\SlimSession\Exception\WriteConflictException) {
+                return $this->factory->createResponse()->withHeader(SessionMiddleware::METADATA_RESPONSE, '1');
+            }
+        }));
+        self::assertSame(['authenticated' => false, 'transport' => 'header'], json_decode((string) $response->getBody(), true));
+        self::assertFalse($response->hasHeader('X-Session-Token'));
+        self::assertNull($this->store->read('http-test', $id));
     }
 
     public function testFinalizationUsesIssuedExpiryWithoutReadingJwtClockAgain(): void
@@ -437,7 +602,9 @@ final class SessionMiddlewareTest extends TestCase
         $store->expects(self::once())->method('release')->with($lease);
         $manager = new SessionManager($store, new SessionConfig('http-test'), $this->clock);
         $middleware = new SessionMiddleware($manager, $this->jwt, new HttpConfig('cookie', 'https://example.test', csrfRequired: false, originRequired: false), $this->clock, $this->factory);
-        $response = $middleware->process(new ServerRequest('POST', '/', ['Cookie' => '__Host-slim-session=' . $token]), $this->handler(function () {
+        $request = (new ServerRequest('POST', '/', ['Cookie' => '__Host-slim-session=' . $token]))
+            ->withAttribute(SessionGuard::ADMISSION_ATTRIBUTE, new AdmissionMetadata('cookie', PHP_INT_MAX));
+        $response = $middleware->process($request, $this->handler(function () {
             self::fail('A valid JWT must not bypass unavailable storage.');
         }));
         self::assertSame(503, $response->getStatusCode());

@@ -9,6 +9,14 @@ use Semhoun\SlimSession\SessionContext;
 final class SessionGuard
 {
     public const ATTRIBUTE = SessionContext::class;
+    public const ADMISSION_ATTRIBUTE = AdmissionMetadata::class;
+
+    public static function admission(ServerRequestInterface $request): ?AdmissionMetadata
+    {
+        self::context($request);
+        $metadata = $request->getAttribute(self::ADMISSION_ATTRIBUTE);
+        return $metadata instanceof AdmissionMetadata ? $metadata : null;
+    }
 
     public static function context(ServerRequestInterface $request): SessionContext
     {

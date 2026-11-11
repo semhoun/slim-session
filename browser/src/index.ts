@@ -45,9 +45,7 @@ export class SessionError extends Error {
 
 const unsafe = (method: string): boolean => !['GET', 'HEAD', 'OPTIONS'].includes(method);
 const deadlineHeaders = ['X-Session-Token-Expires-At', 'X-Session-Idle-Expires-At', 'X-Session-Absolute-Expires-At'] as const;
-let storageQuarantined = false;
-let clearingStorage = false;
-const liveClients = new Set<WeakRef<SessionClient>>();
+const quarantinedStorageKeys = new Set<string>();
 const maxTimerDelay = 2_147_483_647;
 
 export class SessionClient {
@@ -99,14 +97,14 @@ export class SessionClient {
     this.storageKey = `slim-session:${encodeURIComponent(options.application)}:${encodeURIComponent(this.base.href)}`;
     if (options.transport === 'header') this.token = options.token ? this.validToken(options.token) : this.readToken();
     if (options.token) this.persistToken();
-    liveClients.add(new WeakRef(this));
   }
 
   get state(): SessionState { return this.current; }
 
   /** Failed persistent cleanup is independent of server-side revocation. */
   get persistentCleanupFailed(): boolean {
-    return storageQuarantined;
+    return this.options.storage === 'sessionStorage' && this.options.transport === 'header'
+      && quarantinedStorageKeys.has(this.storageKey);
   }
 
   /** Listeners receive immutable state, never credentials or CSRF secrets. */
@@ -244,39 +242,21 @@ export class SessionClient {
     try {
       const storage = this.storage();
       if (!storage) throw new Error('Session storage is unavailable');
-      // Recovery must remove all stale credentials before writing a new one.
-      if (storageQuarantined) storage.clear();
+      // Never restore a credential whose previous cleanup or write failed.
+      if (quarantinedStorageKeys.has(this.storageKey)) storage.removeItem(this.storageKey);
       if (this.token) storage.setItem(this.storageKey, this.token);
-      storageQuarantined = false;
-    } catch { storageQuarantined = true; }
+      quarantinedStorageKeys.delete(this.storageKey);
+    } catch { quarantinedStorageKeys.add(this.storageKey); }
   }
 
   private clearStorage(): void {
-    if (clearingStorage) return;
-    clearingStorage = true;
+    if (this.options.storage !== 'sessionStorage' || this.options.transport !== 'header') return;
     try {
-      storageQuarantined = true;
-      // Invalidate peers before notifying observers so in-flight responses cannot
-      // repopulate storage cleared by another application/client in this module.
-      const peers: SessionClient[] = [];
-      for (const reference of liveClients) {
-        const peer = reference.deref();
-        if (!peer || peer.current.status === 'destroyed') { liveClients.delete(reference); continue; }
-        if (peer === this) continue;
-        peer.invalidate();
-        peer.token = null;
-        peer.csrf = null;
-        peers.push(peer);
-      }
-      try {
-        if (!globalThis.sessionStorage) throw new Error('Session storage is unavailable');
-        globalThis.sessionStorage.clear();
-        storageQuarantined = false;
-      } catch { /* Exposed through persistentCleanupFailed, including cookie mode. */ }
-      for (const peer of peers) {
-        if (peer.current.status !== 'destroyed') peer.publish('unauthenticated', null);
-      }
-    } finally { clearingStorage = false; }
+      const storage = this.storage();
+      if (!storage) throw new Error('Session storage is unavailable');
+      storage.removeItem(this.storageKey);
+      quarantinedStorageKeys.delete(this.storageKey);
+    } catch { quarantinedStorageKeys.add(this.storageKey); }
   }
 
   private async send(url: URL, init: RequestInit, credentials = { token: this.token, csrf: this.csrf }): Promise<Response> {

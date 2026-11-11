@@ -91,6 +91,15 @@ or modifying the reference applications.
 
 ## Executed Checks
 
+The integration-gap changes passed 268 tests and 1,987 assertions on PHP 8.3.36,
+8.4.27, and 8.5.12 with the default file and SQLite backends. PHP 8.3/8.4 ran in
+network-disabled containers with a read-only checkout and private temporary
+storage; PHP 8.5 ran on the host. PHPStan, Composer validation, and
+`git diff --check` passed. The browser suite passed 83 tests, source/consumer
+typechecks, ESM/IIFE builds, and `npm pack --dry-run`. External
+Redis/PostgreSQL/MySQL/MariaDB services and Playwright were not rerun for these
+changes. The results below describe earlier work, not this change's matrix.
+
 The filesystem-backend change passed 152 tests and 868 assertions on PHP 8.3.36,
 8.4.27, and 8.5.12 with file and SQLite backends. PHP 8.3/8.4 ran in isolated
 containers with a read-only checkout and private temporary storage; PHP 8.5 ran

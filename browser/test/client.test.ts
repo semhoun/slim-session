@@ -318,18 +318,28 @@ describe('lifecycle and concurrency', () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it('cancels outstanding requests and ignores late refresh after logout', async () => {
+  it.each(['logout', 'destroy'] as const)('does not persist a late refresh after %s or disturb independent storage', async operation => {
+    const map = new Map([['host-draft', 'keep']]);
+    vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => map.set(key, value),
+      removeItem: (key: string) => map.delete(key) });
     const pending = deferred<Response>();
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(status()).mockReturnValueOnce(pending.promise).mockResolvedValueOnce(new Response(null, { status: 204 }));
-    const instance = client(fetcher);
+    const instance = client(fetcher, { storage: 'sessionStorage' });
+    const peer = client(vi.fn<typeof fetch>().mockResolvedValue(status()), { storage: 'sessionStorage', application: 'race-peer', token: 'peer' });
+    await peer.initialize();
     await instance.initialize();
     const refresh = instance.refresh();
     const signal = fetcher.mock.calls[1]?.[1]?.signal;
-    expect(await instance.logout()).toEqual({ revoked: true });
+    if (operation === 'logout') expect(await instance.logout()).toEqual({ revoked: true });
+    else instance.destroy();
     expect(signal?.aborted).toBe(true);
     pending.resolve(status('header', 'late-token'));
     await refresh;
-    expect(instance.state).toMatchObject({ status: 'unauthenticated', revocation: 'confirmed' });
+    expect(instance.state).toMatchObject(operation === 'logout'
+      ? { status: 'unauthenticated', revocation: 'confirmed' } : { status: 'destroyed', revocation: 'none' });
+    expect([...map.values()]).toEqual(['keep', 'peer']);
+    expect(peer.state.status).toBe('authenticated');
   });
 
   it('ignores stale business responses after header rotation', async () => {
@@ -417,50 +427,71 @@ describe('lifecycle and concurrency', () => {
 });
 
 describe('metadata, storage and scheduling', () => {
-  it('allows peer observers to destroy clients during global cleanup without recursive notifications', () => {
-    const clear = vi.fn();
-    vi.stubGlobal('sessionStorage', { clear });
-    const one = client(vi.fn<typeof fetch>());
-    const two = client(vi.fn<typeof fetch>());
-    const three = client(vi.fn<typeof fetch>());
-    two.subscribe(() => { three.destroy(); two.destroy(); });
-    one.destroy();
-    expect(clear).toHaveBeenCalledTimes(1);
-    expect(two.state.status).toBe('destroyed');
-    expect(three.state.status).toBe('destroyed');
+  it.each(['header', 'cookie'] as const)('never accesses storage throughout the %s memory lifecycle', async transport => {
+    const access = vi.fn(() => { throw Error('storage getter must not be accessed'); });
+    vi.stubGlobal('sessionStorage', undefined);
+    Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, get: access });
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async url =>
+      String(url).endsWith('/logout') ? new Response() : status(transport, 'replacement'));
+    const instance = client(fetcher, { transport, token: '', storage: 'memory' });
+    await instance.initialize();
+    await instance.refresh();
+    await instance.logout();
+    instance.destroy();
+    expect(instance.persistentCleanupFailed).toBe(false);
+    expect(access).not.toHaveBeenCalled();
   });
 
-  it.each(['header', 'cookie'] as const)('clears unrelated tab data on %s logout and blocks peer restoration', async transport => {
-    const map = new Map<string, string>();
+  it.each(['logout', 'destroy', '401', 'status', 'expiry'] as const)('isolates %s cleanup from host data and independent in-flight clients', async operation => {
+    vi.useFakeTimers();
+    const map = new Map<string, string>([['unrelated-draft', 'keep']]);
     const clear = vi.fn(() => map.clear());
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null,
-      setItem: (key: string, value: string) => map.set(key, value), clear });
+      setItem: (key: string, value: string) => map.set(key, value),
+      removeItem: (key: string) => map.delete(key), clear });
     const pending = deferred<Response>();
-    const peerFetch = vi.fn<typeof fetch>().mockReturnValueOnce(pending.promise).mockResolvedValue(new Response());
+    const peerFetch = vi.fn<typeof fetch>().mockResolvedValueOnce(status()).mockReturnValueOnce(pending.promise).mockResolvedValue(new Response());
     const peer = client(peerFetch, { application: 'peer', storage: 'sessionStorage' });
+    await peer.initialize();
+    const listener = vi.fn();
+    peer.subscribe(listener);
     const inFlight = peer.request('pending');
-    const fetcher = vi.fn<typeof fetch>().mockImplementation(async url => String(url).endsWith('/logout') ? new Response() : status(transport));
-    const instance = client(fetcher, { transport });
-    await instance.initialize();
-    map.set('unrelated-draft', 'must disappear');
-    const before = clear.mock.calls.length;
-    await instance.logout();
-    expect(clear).toHaveBeenCalledTimes(before + 1);
-    expect(map.size).toBe(0);
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response());
+    const instance = client(fetcher, { storage: 'sessionStorage' });
+    if (operation === 'logout') await instance.logout();
+    if (operation === 'destroy') instance.destroy();
+    if (operation === '401') {
+      fetcher.mockResolvedValueOnce(new Response(null, { status: 401 }));
+      await instance.request('data');
+    }
+    if (operation === 'status') {
+      fetcher.mockResolvedValueOnce(Response.json({ authenticated: false, transport: 'header' }));
+      await instance.initialize();
+    }
+    if (operation === 'expiry') {
+      fetcher.mockResolvedValueOnce(Response.json({ authenticated: true, transport: 'header', ...deadlines(), tokenExpiresAt: Math.floor(Date.now() / 1000) + 2 }));
+      await instance.initialize();
+      await vi.advanceTimersByTimeAsync(2100);
+    }
+    expect(clear).not.toHaveBeenCalled();
+    expect([...map.values()]).toEqual(['keep', 'initial']);
     expect(instance.persistentCleanupFailed).toBe(false);
-    expect(peer.state.status).toBe('unauthenticated');
-    pending.resolve(new Response(null, { headers: metadataHeaders('stale') }));
-    await expect(inFlight).rejects.toThrow('Stale');
+    expect(peer.state.status).toBe('authenticated');
+    expect(listener).not.toHaveBeenCalled();
+    expect(peerFetch.mock.calls[1]?.[1]?.signal?.aborted).toBe(false);
+    pending.resolve(new Response(null, { headers: metadataHeaders('peer-renewed') }));
+    await inFlight;
     await peer.request('check');
-    expect(new Headers(peerFetch.mock.lastCall?.[1]?.headers).has('Authorization')).toBe(false);
-    expect(map.size).toBe(0);
+    expect(new Headers(peerFetch.mock.lastCall?.[1]?.headers).get('Authorization')).toBe('Bearer peer-renewed');
+    expect([...map.values()]).toEqual(['keep', 'peer-renewed']);
   });
 
   it('does not clear unrelated storage during normal credential persistence', async () => {
     const map = new Map<string, string>();
     const clear = vi.fn(() => map.clear());
     vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null,
-      setItem: (key: string, value: string) => map.set(key, value), clear });
+      setItem: (key: string, value: string) => map.set(key, value),
+      removeItem: (key: string) => map.delete(key), clear });
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(status('header', 'renewed'));
     const instance = client(fetcher, { storage: 'sessionStorage' });
     clear.mockClear();
@@ -470,33 +501,14 @@ describe('metadata, storage and scheduling', () => {
     expect(map.get('draft')).toBe('keep');
   });
 
-  it('reports cookie cleanup failure globally and recovers with a full clear', async () => {
-    const map = new Map([['unrelated', 'draft'], ['slim-session:other', 'stale']]);
-    let fail = true;
-    vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null,
-      setItem: (key: string, value: string) => map.set(key, value),
-      clear: () => { if (fail) throw Error('blocked'); map.clear(); } });
-    const cookie = client(vi.fn<typeof fetch>(), { transport: 'cookie' });
-    cookie.destroy();
-    expect(cookie.persistentCleanupFailed).toBe(true);
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response());
-    const restored = client(fetcher, { application: 'other', storage: 'sessionStorage', token: '' });
-    await restored.request('check');
-    expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).has('Authorization')).toBe(false);
-    expect(restored.persistentCleanupFailed).toBe(true);
-    fail = false;
-    client(fetcher, { storage: 'sessionStorage', token: 'fresh' });
-    expect([...map.values()]).toEqual(['fresh']);
-    expect(cookie.persistentCleanupFailed).toBe(false);
-  });
-
-  it.each(['throws', 'unavailable'] as const)('quarantines failed cleanup when storage %s until removal succeeds', async failure => {
-    const map = new Map<string, string>();
+  it.each(['throws', 'unavailable', 'getter', 'write'] as const)('scopes quarantine when storage %s and recovers only the owned key', async failure => {
+    const map = new Map<string, string>([['host-draft', 'keep']]);
     let fail = false;
     const storage = {
       getItem: (key: string) => map.get(key) ?? null,
-      setItem: (key: string, value: string) => { map.set(key, value); },
-      clear: () => { if (fail) throw Error('blocked'); map.clear(); },
+      setItem: (key: string, value: string) => { if (fail && failure === 'write') throw Error('quota'); map.set(key, value); },
+      removeItem: (key: string) => { if (fail && failure !== 'write') throw Error('blocked'); map.delete(key); },
+      clear: vi.fn(() => { throw Error('global clear forbidden'); }),
     };
     vi.stubGlobal('sessionStorage', storage);
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
@@ -509,29 +521,38 @@ describe('metadata, storage and scheduling', () => {
       return instance;
     };
     const original = client(fetcher, options);
+    const peer = client(fetcher, { storage: 'sessionStorage', application: `peer-${failure}`, token: 'peer' });
     fail = true;
     if (failure === 'unavailable') vi.stubGlobal('sessionStorage', undefined);
-    expect(await original.logout()).toEqual({ revoked: true });
+    if (failure === 'getter') Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, get() { throw Error('denied'); } });
+    if (failure === 'write') {
+      fetcher.mockResolvedValueOnce(status('header', 'renewed'));
+      await original.initialize();
+    } else expect(await original.logout()).toEqual({ revoked: true });
     expect(original.persistentCleanupFailed).toBe(true);
-    expect(original.state.revocation).toBe('confirmed');
+    if (failure !== 'write') expect(original.state.revocation).toBe('confirmed');
+    expect(peer.persistentCleanupFailed).toBe(false);
+    expect(client(fetcher).persistentCleanupFailed).toBe(false);
+    expect(client(fetcher, { transport: 'cookie' }).persistentCleanupFailed).toBe(false);
     vi.stubGlobal('sessionStorage', storage);
     const restored = restore();
     await restored.request('check');
     expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).has('Authorization')).toBe(false);
-    expect(restored.persistentCleanupFailed).toBe(true);
+    expect(restored.persistentCleanupFailed).toBe(failure !== 'write');
     const explicit = client(fetcher, { ...options, token: 'new-login' });
     await explicit.request('check');
     expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).get('Authorization')).toBe('Bearer new-login');
-    expect([...map.values()]).toEqual(['initial']);
+    expect([...map.values()]).toEqual(failure === 'write' ? ['keep', 'peer'] : ['keep', 'initial', 'peer']);
     expect(explicit.persistentCleanupFailed).toBe(true);
     fail = false;
     const cleaned = restore();
     expect(cleaned.persistentCleanupFailed).toBe(false);
-    expect(map.size).toBe(0);
+    expect([...map.values()]).toEqual(['keep', 'peer']);
     client(fetcher, { ...options, token: 'fresh' });
     const fresh = restore();
     await fresh.request('check');
     expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).get('Authorization')).toBe('Bearer fresh');
+    expect(storage.clear).not.toHaveBeenCalled();
   });
 
   it.each(['tokenExpiresAt', 'idleExpiresAt', 'absoluteExpiresAt'] as const)('expires at %s while automatic refresh hangs and ignores late responses', async deadline => {
@@ -607,9 +628,9 @@ describe('metadata, storage and scheduling', () => {
     await expect(instance.request('data')).rejects.toThrow('metadata');
   });
 
-  it('uses isolated storage keys for writes but clears all tab data on destruction', async () => {
+  it('uses isolated storage keys for both writes and destruction', async () => {
     const map = new Map<string, string>();
-    vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null, setItem: (key: string, value: string) => map.set(key, value), clear: () => map.clear() });
+    vi.stubGlobal('sessionStorage', { getItem: (key: string) => map.get(key) ?? null, setItem: (key: string, value: string) => map.set(key, value), removeItem: (key: string) => map.delete(key) });
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(status());
     const one = client(fetcher, { storage: 'sessionStorage' });
     client(fetcher, { storage: 'sessionStorage', application: 'two', token: 'two' });
@@ -617,7 +638,7 @@ describe('metadata, storage and scheduling', () => {
     expect(map.size).toBe(3);
     map.set('unrelated', 'draft');
     one.destroy();
-    expect(map.size).toBe(0);
+    expect([...map.values()]).toEqual(['two', 'three', 'draft']);
   });
 
   it('falls back to memory on all storage failures', async () => {

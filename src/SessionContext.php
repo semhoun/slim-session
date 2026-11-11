@@ -19,6 +19,7 @@ final class SessionContext
     private ?SessionResponseMetadata $pending = null;
     private bool $issueToken = false;
     private bool $cleanupPending = false;
+    private bool $creationResponsePending = false;
     /** @var array<string, mixed> */
     private array $data = [];
     /** @var array<string, mixed> */
@@ -52,7 +53,7 @@ final class SessionContext
     public function pendingResponse(): ?SessionResponseMetadata { return $this->pending; }
 
     /** @param array<string, mixed> $data */
-    public function create(array $data = []): void
+    public function create(array $data = [], ?int $absoluteExpiresAt = null): void
     {
         if ($this->state !== SessionState::Absent) {
             throw new InvalidSessionStateException('Only an absent context can create a session.');
@@ -63,16 +64,22 @@ final class SessionContext
             $lease = $this->store->acquire($this->config->namespace, $id, $this->secret(), $this->config->leaseMilliseconds, $this->config->acquisitionTimeoutMilliseconds);
             try {
                 $now = $this->clock->now()->getTimestamp();
-                $record = new SessionRecord($id, 0, $data, [], $now, $now, $now + min($this->config->idleLifetime, $this->config->absoluteLifetime), $now + $this->config->absoluteLifetime, $this->secret(), $this->secret());
+                $absolute = min($now + $this->config->absoluteLifetime, $absoluteExpiresAt ?? PHP_INT_MAX);
+                if ($absolute <= $now) {
+                    throw new InvalidSessionStateException('The requested absolute deadline has expired.');
+                }
+                $record = new SessionRecord($id, 0, $data, [], $now, $now, min($now + $this->config->idleLifetime, $absolute), $absolute, $this->secret(), $this->secret());
                 if ($this->store->create($this->config->namespace, $record, $lease)) {
                     $this->record = $record;
                     $this->lease = $lease;
                     $this->data = $record->data;
+                    $this->flash = [];
                     $this->activityAt = $now;
                     $this->state = SessionState::Open;
                     $this->issueToken = true;
                     $this->pending = new SessionResponseMetadata($record, true);
                     $this->cleanupPending = true;
+                    $this->creationResponsePending = true;
                     return;
                 }
             } catch (\Throwable $e) {
@@ -82,6 +89,34 @@ final class SessionContext
             $this->store->release($lease);
         }
         throw new WriteConflictException('Unable to allocate a session.');
+    }
+
+    /** @param array<string, mixed> $data */
+    public function startNew(array $data = [], ?int $absoluteExpiresAt = null): void
+    {
+        if ($this->state === SessionState::Absent) {
+            $this->create($data, $absoluteExpiresAt);
+            return;
+        }
+        $this->open();
+        // Revocation and creation are separate commits; never restore the old identity.
+        $this->pending = new SessionResponseMetadata(null, false, true);
+        $this->issueToken = false;
+        $this->creationResponsePending = false;
+        try {
+            $this->destroy();
+            $this->record = null;
+            $this->activityAt = 0;
+            $this->state = SessionState::Absent;
+            $this->create($data, $absoluteExpiresAt);
+        } catch (\Throwable $e) {
+            $this->record = null;
+            $this->data = $this->flash = [];
+            $this->activityAt = 0;
+            $this->state = SessionState::Destroyed;
+            $this->pending = new SessionResponseMetadata(null, false, true);
+            throw $e;
+        }
     }
 
     public function has(string $key): bool
@@ -158,6 +193,7 @@ final class SessionContext
         try {
             $this->lease = $this->store->renewLease($this->lease(), $this->config->leaseMilliseconds);
         } catch (\Throwable $e) {
+            $this->suppressCreationResponse();
             $this->discard();
             throw $e;
         }
@@ -166,10 +202,11 @@ final class SessionContext
     public function save(): void
     {
         $this->open();
-        $record = $this->snapshot();
         try {
+            $record = $this->snapshot();
             $this->store->save($this->config->namespace, $record, $this->record->revision, $this->lease());
         } catch (\Throwable $e) {
+            $this->suppressCreationResponse();
             $this->discard();
             throw $e;
         }
@@ -188,16 +225,18 @@ final class SessionContext
     public function rotate(bool $preserveData = true): void
     {
         $this->open();
-        $current = $this->snapshot();
-        $record = new SessionRecord(SessionId::generate($this->random), 0, $preserveData ? $current->data : [], $preserveData ? $current->flash : [], $current->createdAt, $current->lastActivityAt, $current->idleExpiresAt, $current->absoluteExpiresAt, $this->secret(), $this->secret());
         try {
+            $current = $this->snapshot();
+            $record = new SessionRecord(SessionId::generate($this->random), 0, $preserveData ? $current->data : [], $preserveData ? $current->flash : [], $current->createdAt, $current->lastActivityAt, $current->idleExpiresAt, $current->absoluteExpiresAt, $this->secret(), $this->secret());
             $lease = $this->store->rotate($this->config->namespace, $this->record->id, $this->record->revision, $record, $this->lease());
         } catch (\Throwable $e) {
+            $this->suppressCreationResponse();
             $this->discard();
             throw $e;
         }
         $this->record = $record;
         $this->lease = $lease;
+        $this->creationResponsePending = false;
         $this->data = $record->data;
         $this->flash = $record->flash;
         $this->issueToken = true;
@@ -226,6 +265,16 @@ final class SessionContext
         if ($this->state === SessionState::Open) { $this->state = SessionState::Closed; }
         if ($lease !== null) { $this->store->release($lease); }
         if ($cleanup) { $this->cleanupExpiredSessions(); }
+    }
+
+    private function suppressCreationResponse(): void
+    {
+        if (!$this->creationResponsePending) { return; }
+        $this->record = null;
+        $this->data = $this->flash = [];
+        $this->issueToken = false;
+        $this->pending = new SessionResponseMetadata(null, false, true);
+        $this->creationResponsePending = false;
     }
 
     private function cleanupExpiredSessions(): void

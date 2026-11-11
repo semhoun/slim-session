@@ -44,6 +44,10 @@ or suspending a browser before its renewal window can therefore require
 reauthentication. A persistent cookie does not change this rule. JWT clock
 tolerance never extends storage deadlines.
 
+Creation may also supply a server-calculated `absoluteExpiresAt` bound. It can
+shorten, never extend, the configured lifetime and is checked with real time after
+lease acquisition. See the [creation contract](contracts.md#bounded-creation-and-new-authentication).
+
 ## Exactly One Transport
 
 Configure either cookies or headers for each integration, not automatic
@@ -181,6 +185,12 @@ contexts do not silently reopen. Rotation requires an open context, creates a
 fresh UUIDv4, invalidates the old ID atomically, and independently changes both
 the verification secret and CSRF proof. Ordinary JWT renewal retains all three.
 
+`startNew()` explicitly creates from absent or revokes and replaces an open
+identity on the same context. It retains no old application data, flash, or
+secrets and starts fresh creation deadlines. Unlike rotation, replacement is two
+storage operations, not an atomic exchange. Failure after revocation does not
+restore the old identity and must not issue a replacement credential.
+
 Normal handler returns commit open sessions, including 4xx responses: a handler
 may intentionally update attempt counters or flash messages. Uncaught handler
 exceptions discard uncommitted changes and release the lease. An earlier
@@ -215,11 +225,14 @@ Applications should avoid overlapping login/rotation/logout transitions.
 Local client destruction cancels work and clears local credentials; it is not
 confirmed server revocation. Failed logout must report revocation as
 unconfirmed. The browser client never retries a business mutation automatically.
-Logout, destruction, 401, unauthenticated status, and local expiration attempt
-`sessionStorage.clear()` even in cookie or memory mode. This removes unrelated
-same-origin tab data as well as credentials. Live clients in the same module are
-invalidated; failed clears quarantine all stored-token restoration in that module.
-`persistentCleanupFailed` exposes failure independently of server revocation.
+Memory and cookie clients never access browser storage. Persistent header clients
+remove only their application/base-URL credential key on logout, destruction,
+401, unauthenticated status, or local expiration. They never clear the origin's
+storage or invalidate independent clients. Failed removals/writes quarantine only
+the affected key; recovery never touches another key. Identically configured
+persistent clients share a slot, not a coordinated lifecycle, so explicitly
+coordinate them when shared logout is required. `persistentCleanupFailed`
+exposes failure independently of server revocation.
 Inaccessible storage cannot be guaranteed erased; quarantine does not survive a
 reload or span separate module copies/realms. Other tabs and localStorage are not
 cleared, and cookie removal remains server-controlled.

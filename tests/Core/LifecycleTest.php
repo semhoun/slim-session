@@ -663,7 +663,7 @@ final class LifecycleTest extends TestCase
 
     public static function forbiddenClosedOperations(): iterable
     {
-        foreach (['create', 'save', 'renew', 'renewLease', 'rotate', 'destroy', 'clear', 'excludeActivity'] as $method) {
+        foreach (['create', 'startNew', 'save', 'renew', 'renewLease', 'rotate', 'destroy', 'clear', 'excludeActivity'] as $method) {
             yield $method => [$method];
         }
     }

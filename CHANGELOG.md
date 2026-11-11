@@ -18,6 +18,10 @@
 
 ### Fixed
 
+- Automatic JWT renewal now starts halfway through the actual token lifetime,
+  including tokens shortened by the session's absolute deadline. Browser clients
+  use the server-provided refresh timestamp so delayed initialization does not
+  postpone renewal. Explicit fixed-window overrides remain available.
 - Browser logout, teardown, and local expiration no longer erase unrelated
   same-origin tab data or invalidate independent clients. Persistent header
   clients remove only their own application/base-URL credential key; memory and

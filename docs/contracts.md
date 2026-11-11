@@ -206,10 +206,19 @@ producers. Never use a generic cache as the atomic session store.
 
 `JwtService::issue(string $sessionId, int $absoluteExpiresAt, string $verificationSecret)`
 returns a JWT. `issueWithExpiry()` takes the same required arguments and returns
-an `IssuedToken` containing the token and its expiry from one clock snapshot.
+an `IssuedToken` containing the token, `expiresAt`, and `refreshAt` from one
+clock snapshot. Its constructor accepts these three values in that order.
 Supply the current committed record's ID, deadline, and secret. Verification
 returns a `VerifiedToken`, including `verificationSecret`; signature verification
 alone is not sufficient to authenticate. Neither API supports legacy credentials.
+
+By default `JwtService` renews at `issuedAt + ceil((expiresAt - issuedAt) / 2)`,
+using the actual token lifetime, including an absolute-deadline cap. Its optional
+`?int $renewalWindow = null` constructor argument selects this default; an
+explicit nonnegative integer retains a fixed window before expiry.
+`refreshAt(int $issuedAt, int $expiresAt)` exposes the selected policy.
+Automatic PHP renewal occurs on authenticated requests, not in a background job.
+Explicit refresh remains available before the threshold and does not mark activity.
 
 The status/refresh representation uses Unix-second deadlines:
 
@@ -218,6 +227,7 @@ The status/refresh representation uses Unix-second deadlines:
   "authenticated": true,
   "transport": "cookie",
   "tokenExpiresAt": 2000000000,
+  "tokenRefreshAt": 1999956800,
   "idleExpiresAt": 2000000000,
   "absoluteExpiresAt": 2000500000,
   "csrfToken": "session-bound-proof"
@@ -226,9 +236,12 @@ The status/refresh representation uses Unix-second deadlines:
 
 Unauthenticated status omits deadlines. Cookie responses never expose the JWT.
 Header responses use `X-Session-Token` by default. Business responses use
-`X-Session-Token-Expires-At`, `X-Session-Idle-Expires-At`, and
+`X-Session-Token-Expires-At`, `X-Session-Token-Refresh-At`, `X-Session-Idle-Expires-At`, and
 `X-Session-Absolute-Expires-At`. Cookie responses also return `X-CSRF-Token`.
 Applications own route names, CORS, and preflight processing.
+Expose the refresh timestamp header through CORS alongside the deadline headers.
+The timestamp always belongs to the response's current credential, including
+when that credential is unchanged. It never extends idle or absolute deadlines.
 
 ### Incoming Admission Metadata
 

@@ -59,7 +59,8 @@ self-hosted standalone scripts for plain HTML.
 
 The defaults are a 24-hour JWT, 24-hour idle deadline, seven-day absolute
 lifetime, two-second lock acquisition timeout, and 30-second lease. Renewal
-normally occurs in the final JWT hour. An expired JWT cannot renew, even if
+starts halfway through the actual JWT lifetime (12 hours for a 24-hour token).
+An expired JWT cannot renew, even if
 the browser was suspended and its server record remains live.
 
 See [security and lifecycle boundaries](docs/security.md) before integration.

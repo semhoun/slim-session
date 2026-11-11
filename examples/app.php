@@ -122,7 +122,7 @@ $app->add(function (Request $request, RequestHandlerInterface $handler) use ($co
     if ($allowed !== null) {
         $response = $response->withHeader('Access-Control-Allow-Origin', $allowed)
             ->withHeader('Access-Control-Expose-Headers', ($match[1] === 'cookie' ? 'X-CSRF-Token' : 'X-Session-Token')
-                . ', X-Session-Token-Expires-At, X-Session-Idle-Expires-At, X-Session-Absolute-Expires-At');
+                . ', X-Session-Token-Expires-At, X-Session-Token-Refresh-At, X-Session-Idle-Expires-At, X-Session-Absolute-Expires-At');
         if ($match[1] === 'cookie') { $response = $response->withHeader('Access-Control-Allow-Credentials', 'true'); }
     }
     return $response;

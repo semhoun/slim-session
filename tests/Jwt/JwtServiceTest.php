@@ -61,7 +61,43 @@ final class JwtServiceTest extends TestCase
             self::assertSame(1700000000, $verified->issuedAt);
             self::assertSame(min(1700086400, $deadline), $issued->expiresAt);
             self::assertSame($verified->expiresAt, $issued->expiresAt);
+            self::assertSame($this->service()->refreshAt($verified->issuedAt, $verified->expiresAt), $issued->refreshAt);
+            self::assertSame(1700000000 + (int) ceil(($issued->expiresAt - 1700000000) / 2), $issued->refreshAt);
         }
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('refreshPolicies')]
+    public function testRefreshPolicyUsesActualIssuedInterval(int $lifetime, int $cap, ?int $window, int $expected): void
+    {
+        $service = new JwtService($this->clock(), 'application-a', 'audience-a', ['current' => str_repeat('a', 32)], 'current',
+            lifetime: $lifetime, renewalWindow: $window);
+        $issued = $service->issueWithExpiry(self::ID, 1700000000 + $cap, self::PROOF);
+        $verified = $service->verify($issued->token);
+        self::assertSame($window, $service->renewalWindow);
+        self::assertSame(1700000000 + min($lifetime, $cap), $issued->expiresAt);
+        self::assertSame(1700000000 + $expected, $issued->refreshAt);
+        self::assertSame($issued->refreshAt, $service->refreshAt($verified->issuedAt, $verified->expiresAt));
+    }
+
+    public static function refreshPolicies(): array
+    {
+        return [
+            'even' => [100, 200, null, 50],
+            'odd rounds up' => [101, 200, null, 51],
+            'absolute cap' => [100, 40, null, 20],
+            'odd absolute cap' => [100, 41, null, 21],
+            'one second' => [1, 200, null, 1],
+            'explicit window' => [100, 200, 10, 90],
+            'window with cap' => [100, 41, 10, 31],
+            'window cannot precede issuance' => [100, 41, 200, 0],
+            'zero window' => [100, 200, 0, 100],
+        ];
+    }
+
+    public function testNegativeRenewalWindowRejected(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new JwtService($this->clock(), 'application-a', 'audience-a', ['current' => str_repeat('a', 32)], 'current', renewalWindow: -1);
     }
 
     public function testExpiredOfflineTokenCannotRefreshEvenIfSessionRemainsLive(): void

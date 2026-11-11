@@ -22,11 +22,11 @@ final class JwtService
         array $keys,
         private readonly string $activeKeyId,
         public readonly int $lifetime = 86400,
-        public readonly int $renewalWindow = 3600,
+        public readonly ?int $renewalWindow = null,
         private readonly int $maximumBytes = 4096,
         private readonly int $clockTolerance = 0,
     ) {
-        if ($issuer === '' || $audience === '' || !isset($keys[$activeKeyId]) || $lifetime < 1 || $renewalWindow < 0 || $maximumBytes < 256 || $clockTolerance < 0) {
+        if ($issuer === '' || $audience === '' || !isset($keys[$activeKeyId]) || $lifetime < 1 || ($renewalWindow !== null && $renewalWindow < 0) || $maximumBytes < 256 || $clockTolerance < 0) {
             throw new \InvalidArgumentException('Invalid JWT configuration.');
         }
         $validated = [];
@@ -42,6 +42,15 @@ final class JwtService
     public function expiresAt(int $absoluteExpiresAt): int
     {
         return min($this->clock->now()->getTimestamp() + $this->lifetime, $absoluteExpiresAt);
+    }
+
+    public function refreshAt(int $issuedAt, int $expiresAt): int
+    {
+        if ($this->renewalWindow !== null) {
+            return max($issuedAt, $expiresAt - $this->renewalWindow);
+        }
+        $duration = $expiresAt - $issuedAt;
+        return $issuedAt + intdiv($duration, 2) + $duration % 2;
     }
 
     public function issue(string $sessionId, int $absoluteExpiresAt, string $verificationSecret): string
@@ -66,7 +75,7 @@ final class JwtService
         if (strlen($token) > $this->maximumBytes) {
             throw new InvalidTokenException('Token exceeds configured size.');
         }
-        return new IssuedToken($token, $expiry);
+        return new IssuedToken($token, $expiry, $this->refreshAt($now->getTimestamp(), $expiry));
     }
 
     public function verify(string $encoded): VerifiedToken

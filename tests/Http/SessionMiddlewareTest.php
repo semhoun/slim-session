@@ -125,6 +125,7 @@ final class SessionMiddlewareTest extends TestCase
         $response = $this->middleware()->process(new ServerRequest('GET', '/'), new StatusHandler($this->factory));
         self::assertSame(['authenticated' => false, 'transport' => 'header'], json_decode((string) $response->getBody(), true));
         self::assertFalse($response->hasHeader('X-Session-Token'));
+        self::assertFalse($response->hasHeader('X-Session-Token-Refresh-At'));
         $this->expectException(\LogicException::class);
         SessionGuard::requireSession(new ServerRequest('GET', '/'));
     }
@@ -320,12 +321,66 @@ final class SessionMiddlewareTest extends TestCase
         $this->jwt = new JwtService($clock, 'http-test', 'http-test', ['current' => str_repeat('a', 32)], 'current', lifetime: 1);
         $response = $this->middleware()->process(new ServerRequest('POST', '/login'), $this->handler(function ($request) {
             SessionGuard::context($request)->create();
-            return $this->factory->createResponse();
+            return $this->factory->createResponse()->withHeader(SessionMiddleware::METADATA_RESPONSE, '1');
         }));
         self::assertSame(200, $response->getStatusCode());
         self::assertSame(1, $clock->calls);
         self::assertNotSame('', $response->getHeaderLine('X-Session-Token'));
         self::assertSame('1700000001', $response->getHeaderLine('X-Session-Token-Expires-At'));
+        self::assertSame('1700000001', $response->getHeaderLine('X-Session-Token-Refresh-At'));
+        $metadata = json_decode((string) $response->getBody(), true);
+        self::assertSame(1700000001, $metadata['tokenExpiresAt']);
+        self::assertSame(1700000001, $metadata['tokenRefreshAt']);
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('renewalThresholds')]
+    public function testAutomaticRenewalAndMetadataFollowActualTokenThreshold(int $lifetime, int $cap, ?int $window, int $elapsed, bool $renewed): void
+    {
+        foreach (['header', 'cookie'] as $transport) {
+            $this->clock->time = 1700000000;
+            $this->jwt = new JwtService($this->clock, 'http-test', 'http-test', ['current' => str_repeat('a', 32)], 'current',
+                lifetime: $lifetime, renewalWindow: $window);
+            $context = $this->manager->create(absoluteExpiresAt: $this->clock->time + $cap);
+            $record = $context->record();
+            $context->saveAndClose();
+            $incoming = $this->jwt->issueWithExpiry($record->id, $record->absoluteExpiresAt, $record->verificationSecret);
+            $this->clock->time += $elapsed;
+            $request = $transport === 'header' ? $this->request($incoming->token)
+                : new ServerRequest('GET', '/', ['Cookie' => '__Host-slim-session=' . $incoming->token]);
+            $response = $this->middleware($transport)->process($request, new StatusHandler($this->factory));
+            self::assertSame(200, $response->getStatusCode());
+            self::assertSame($renewed, $response->hasHeader($transport === 'header' ? 'X-Session-Token' : 'Set-Cookie'));
+            $encoded = $incoming->token;
+            if ($renewed) {
+                $encoded = $transport === 'header' ? $response->getHeaderLine('X-Session-Token')
+                    : explode(';', substr($response->getHeaderLine('Set-Cookie'), strlen('__Host-slim-session=')))[0];
+            }
+            $verified = $this->jwt->verify($encoded);
+            self::assertSame(1700000000 + ($renewed ? $elapsed : 0), $verified->issuedAt);
+            $refreshAt = $this->jwt->refreshAt($verified->issuedAt, $verified->expiresAt);
+            $metadata = json_decode((string) $response->getBody(), true);
+            self::assertSame($verified->expiresAt, $metadata['tokenExpiresAt']);
+            self::assertSame($refreshAt, $metadata['tokenRefreshAt']);
+            self::assertSame((string) $verified->expiresAt, $response->getHeaderLine('X-Session-Token-Expires-At'));
+            self::assertSame((string) $refreshAt, $response->getHeaderLine('X-Session-Token-Refresh-At'));
+            self::assertSame($record->idleExpiresAt, $this->store->read('http-test', $record->id)->idleExpiresAt);
+            self::assertSame($record->absoluteExpiresAt, $metadata['absoluteExpiresAt']);
+        }
+    }
+
+    public static function renewalThresholds(): array
+    {
+        $cases = [];
+        foreach (['even' => [100, 200, null, 50], 'odd' => [101, 200, null, 51],
+            'capped' => [100, 40, null, 20], 'odd capped' => [100, 41, null, 21],
+            'override' => [100, 200, 10, 90], 'capped override' => [100, 41, 10, 31]] as $name => [$lifetime, $cap, $window, $threshold]) {
+            foreach ([-1, 0, 1] as $offset) {
+                $cases[$name . ' offset ' . $offset] = [$lifetime, $cap, $window, $threshold + $offset, $offset >= 0];
+            }
+        }
+        $cases['zero override before expiry'] = [100, 200, 0, 99, false];
+        $cases['large override at issuance'] = [100, 41, 200, 0, true];
+        return $cases;
     }
 
     public function testNormalFourHundredPersistsAndExceptionDiscardsAndReleases(): void
@@ -449,6 +504,7 @@ final class SessionMiddlewareTest extends TestCase
         $request = new ServerRequest('POST', '/', ['Cookie' => '__Host-slim-session=' . $token, 'Origin' => 'https://example.test', 'X-CSRF-Token' => $csrf]);
         $response = $this->middleware('cookie')->process($request, new LogoutHandler($this->factory));
         self::assertSame(204, $response->getStatusCode());
+        self::assertFalse($response->hasHeader('X-Session-Token-Refresh-At'));
         self::assertSame('__Host-slim-session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax', $response->getHeaderLine('Set-Cookie'));
         self::assertNull($this->store->read('http-test', $id));
         self::assertSame(401, $this->middleware()->process($this->request($token), new StatusHandler($this->factory))->getStatusCode());
@@ -497,8 +553,10 @@ final class SessionMiddlewareTest extends TestCase
         $response = $middleware->process(new ServerRequest('GET', '/'), new StatusHandler($this->factory));
         self::assertFalse(json_decode((string) $response->getBody(), true)['authenticated']);
         self::assertFalse($response->hasHeader('X-CSRF-Token'));
+        self::assertFalse($response->hasHeader('X-Session-Token-Refresh-At'));
         $response = $middleware->process(new ServerRequest('GET', '/', ['Cookie' => '__Host-slim-session=forged']), new StatusHandler($this->factory));
         self::assertSame(401, $response->getStatusCode());
+        self::assertFalse($response->hasHeader('X-Session-Token-Refresh-At'));
         self::assertStringContainsString('Max-Age=0', $response->getHeaderLine('Set-Cookie'));
     }
 

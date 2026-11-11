@@ -49,7 +49,7 @@ final class SessionMiddleware implements MiddlewareInterface
             if ($token !== null && $this->config->transport === 'cookie') {
                 $this->protect($request, $context);
             }
-            if ($token !== null && $token->expiresAt - $this->clock->now()->getTimestamp() <= $this->jwt->renewalWindow) {
+            if ($token !== null && $this->clock->now()->getTimestamp() >= $this->jwt->refreshAt($token->issuedAt, $token->expiresAt)) {
                 $context->renew();
             }
             $admission = $token === null ? null : new AdmissionMetadata($this->config->transport, $token->expiresAt);
@@ -137,16 +137,20 @@ final class SessionMiddleware implements MiddlewareInterface
             }
         } elseif (($record = $pending->record ?? $context->record()) !== null) {
             $expiry = $token?->expiresAt;
+            $refreshAt = $token === null ? null : $this->jwt->refreshAt($token->issuedAt, $token->expiresAt);
             if ($pending?->issueToken) {
                 $issued = $this->jwt->issueWithExpiry($record->id, $record->absoluteExpiresAt, $record->verificationSecret);
                 $encoded = $issued->token;
                 $expiry = $issued->expiresAt;
+                $refreshAt = $issued->refreshAt;
                 $response = $this->config->transport === 'cookie'
                     ? $response->withAddedHeader('Set-Cookie', $this->cookie($encoded, max(0, $expiry - $this->clock->now()->getTimestamp())))
                     : $response->withHeader($this->config->responseTokenHeader, $encoded);
             }
             $metadata = ['authenticated' => true, 'transport' => $this->config->transport,
-                'tokenExpiresAt' => $expiry, 'idleExpiresAt' => $record->idleExpiresAt, 'absoluteExpiresAt' => $record->absoluteExpiresAt];
+                'tokenExpiresAt' => $expiry, 'tokenRefreshAt' => $refreshAt,
+                'idleExpiresAt' => $record->idleExpiresAt, 'absoluteExpiresAt' => $record->absoluteExpiresAt];
+            $response = $response->withHeader('X-Session-Token-Refresh-At', (string) $refreshAt);
             foreach (['token' => $expiry, 'idle' => $record->idleExpiresAt, 'absolute' => $record->absoluteExpiresAt] as $name => $value) {
                 $response = $response->withHeader('X-Session-' . ucfirst($name) . '-Expires-At', (string) $value);
             }

@@ -33,7 +33,11 @@ removing a key immediately invalidates its JWTs regardless of stored records.
 ## Deadlines
 
 Defaults are a 24-hour JWT, 24-hour idle timeout, seven-day absolute lifetime,
-and renewal during the JWT's final hour. JWT expiration never exceeds the
+and renewal halfway through the JWT's actual lifetime. PHP renews on the first
+authenticated request at or after that point; browser clients schedule a refresh
+using the server's `tokenRefreshAt` timestamp. A token shortened by the absolute
+deadline uses its shortened lifetime, not the configured maximum. Odd-second
+lifetimes round the midpoint up to the next whole second. JWT expiration never exceeds the
 absolute deadline. Activity cannot extend the absolute deadline. Status and
 refresh are not activity; server-side policy can exclude other routes.
 Unexcluded background polling can keep a session alive until its absolute

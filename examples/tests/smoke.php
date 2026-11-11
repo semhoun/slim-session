@@ -63,7 +63,7 @@ try {
         $login = $request('POST', $base . 'login', $loginHeaders, ['username' => 'demo']);
         $assert($login->getStatusCode() === 201, 'Explicit session login failed for ' . $mode . ': ' . $login->getStatusCode() . ' ' . (string) $login->getBody());
         $assert($login->getHeaderLine('Access-Control-Expose-Headers') === ($mode === 'cookie' ? 'X-CSRF-Token' : 'X-Session-Token')
-            . ', X-Session-Token-Expires-At, X-Session-Idle-Expires-At, X-Session-Absolute-Expires-At', 'Exposed headers do not match transport.');
+            . ', X-Session-Token-Expires-At, X-Session-Token-Refresh-At, X-Session-Idle-Expires-At, X-Session-Absolute-Expires-At', 'Exposed headers do not match transport.');
         if ($mode === 'cookie') {
             $headers['Cookie'] = $cookieFrom($login, '__Host-example-session');
             $assert(!$login->hasHeader('X-Session-Token'), 'Cookie JWT leaked into response token header.');
@@ -80,6 +80,9 @@ try {
         $metadata = json_decode((string) $status->getBody(), true, flags: JSON_THROW_ON_ERROR);
         $assert(!array_key_exists('svp', $metadata) && !array_key_exists('verificationSecret', $metadata), 'Verification secret leaked in metadata.');
         $assert($metadata['authenticated'] === true && $metadata['transport'] === $mode, 'Status protocol mismatch.');
+        $refreshAt = $claims['iat'] + intdiv($claims['exp'] - $claims['iat'] + 1, 2);
+        $assert($metadata['tokenRefreshAt'] === $refreshAt, 'Refresh timestamp does not match JWT midpoint.');
+        $assert($status->getHeaderLine('X-Session-Token-Refresh-At') === (string) $refreshAt, 'Refresh timestamp header mismatch.');
         if ($mode === 'cookie') {
             $assert($request('POST', $base . 'data', $headers)->getStatusCode() === 403, 'Cookie mutation without CSRF accepted.');
             $headers['X-CSRF-Token'] = $metadata['csrfToken'];

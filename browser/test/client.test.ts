@@ -427,6 +427,96 @@ describe('lifecycle and concurrency', () => {
 });
 
 describe('metadata, storage and scheduling', () => {
+  it.each(['header', 'cookie'] as const)('refreshes %s JWTs at the original midpoint, not halfway from initialization', async transport => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const issuedAt = Date.now() / 1000;
+    const data = { ...deadlines(), tokenExpiresAt: issuedAt + 86400, tokenRefreshAt: issuedAt + 43200 };
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({
+      authenticated: true, transport, ...data, ...(transport === 'cookie' ? { csrfToken: 'csrf-one' } : {}),
+    }));
+    vi.setSystemTime((issuedAt + 28800) * 1000);
+    const instance = client(fetcher, { transport, autoRefresh: true });
+    await instance.initialize();
+    await vi.advanceTimersByTimeAsync(14399_000);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.lastCall?.[0]).toContain('/session/refresh');
+    expect(fetcher.mock.lastCall?.[1]?.method).toBe('POST');
+  });
+
+  it('refreshes promptly when initialized after the midpoint', async () => {
+    vi.useFakeTimers();
+    const now = Math.floor(Date.now() / 1000);
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({
+      authenticated: true, transport: 'header', ...deadlines(), tokenRefreshAt: now - 10,
+    }));
+    await client(fetcher, { autoRefresh: true }).initialize();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps an explicit refresh-ahead override and supports older servers', async () => {
+    vi.useFakeTimers();
+    const now = Math.floor(Date.now() / 1000);
+    const overridden = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({
+      authenticated: true, transport: 'header', ...deadlines(), tokenExpiresAt: now + 100, tokenRefreshAt: now + 50,
+    }));
+    await client(overridden, { autoRefresh: true, refreshAheadSeconds: 10 }).initialize();
+    await vi.advanceTimersByTimeAsync(89000);
+    expect(overridden).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(overridden).toHaveBeenCalledTimes(2);
+    clients.splice(0).forEach(instance => instance.destroy());
+    const legacy = vi.fn<typeof fetch>().mockImplementation(async () => status());
+    await client(legacy, { autoRefresh: true }).initialize();
+    await vi.advanceTimersByTimeAsync(3599_000);
+    expect(legacy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(legacy).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['header', 'cookie'] as const)('keeps %s refresh scheduling paired with a newer JWT when responses arrive out of order', async transport => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const now = Date.now() / 1000;
+    const initial = { ...deadlines(), tokenExpiresAt: now + 100, tokenRefreshAt: now + 50 };
+    const late = deferred<Response>();
+    const jwt = (marker: number): string => `header.${btoa(JSON.stringify({ sub: 'same-session', marker }))}.signature`;
+    const newer = metadataHeaders(transport === 'header' ? jwt(2) : undefined, 'csrf-one');
+    newer.set('X-Session-Token-Expires-At', String(initial.tokenExpiresAt));
+    newer.set('X-Session-Token-Refresh-At', String(now + 75));
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({
+      authenticated: true, transport, ...initial, ...(transport === 'cookie' ? { csrfToken: 'csrf-one' } : {}),
+    })).mockReturnValueOnce(late.promise).mockResolvedValueOnce(new Response(null, { headers: newer }))
+      .mockImplementation(async () => status(transport));
+    const instance = client(fetcher, { transport, token: jwt(0), autoRefresh: true });
+    await instance.initialize();
+    const pending = instance.request('older');
+    await instance.request('newer');
+    const older = metadataHeaders(transport === 'header' ? jwt(1) : undefined, 'csrf-one');
+    older.set('X-Session-Token-Expires-At', String(initial.tokenExpiresAt));
+    older.set('X-Session-Token-Refresh-At', String(now + 50));
+    late.resolve(new Response(null, { headers: older }));
+    await pending;
+    expect(instance.state.metadata?.tokenRefreshAt).toBe(now + 75);
+    await vi.advanceTimersByTimeAsync(74000);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    if (transport === 'header') expect(new Headers(fetcher.mock.lastCall?.[1]?.headers).get('Authorization')).toBe(`Bearer ${jwt(2)}`);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, 'tomorrow', null, Number.MAX_SAFE_INTEGER])('rejects invalid refresh timestamp %s', async tokenRefreshAt => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      authenticated: true, transport: 'header', ...deadlines(), tokenRefreshAt,
+    }));
+    await expect(client(fetcher).initialize()).rejects.toThrow('refresh deadline');
+  });
+
   it.each(['header', 'cookie'] as const)('never accesses storage throughout the %s memory lifecycle', async transport => {
     const access = vi.fn(() => { throw Error('storage getter must not be accessed'); });
     vi.stubGlobal('sessionStorage', undefined);

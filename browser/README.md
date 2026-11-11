@@ -183,8 +183,17 @@ copies. Storage cannot be guaranteed erased when inaccessible. Check
 erase HttpOnly cookies or revoke server sessions; confirmed server revocation
 remains essential.
 
-`autoRefresh` defaults to true. `refreshAheadSeconds` defaults to 3600. Scheduling
-uses server-provided Unix-second expiration metadata; it never parses the JWT.
+`autoRefresh` defaults to true. By default, scheduling uses the server-provided
+`tokenRefreshAt` Unix-second timestamp: halfway through the actual JWT lifetime
+(12 hours for a 24-hour JWT). Initialization or later business responses do not
+restart that lifetime. A midpoint already passed triggers refresh after a minimum
+one-second delay, provided the session has not expired. Scheduling never parses
+JWT claims, including in cookie mode.
+
+An explicitly configured `refreshAheadSeconds` retains a fixed window before
+token expiry instead of the server timestamp. Older servers without
+`tokenRefreshAt` retain the previous one-hour-before-expiry fallback; upgrade the
+server and expose `X-Session-Token-Refresh-At` through CORS for midpoint scheduling.
 Automatic refresh has at most two retries after a failure, using exponential
 backoff. Failures do not replay business requests. Local expiration still clears
 credentials if refresh fails or never settles, using an independent expiry timer.
@@ -203,6 +212,7 @@ Status and refresh return no-store JSON:
   "authenticated": true,
   "transport": "cookie",
   "tokenExpiresAt": 1794153600,
+  "tokenRefreshAt": 1794110400,
   "idleExpiresAt": 1794153600,
   "absoluteExpiresAt": 1794672000,
   "csrfToken": "session-bound-proof"
@@ -216,10 +226,13 @@ Unix seconds. Successful status checks cannot authenticate a header client that
 has no credential. A 401 clears local authentication.
 
 Application responses, including committed 4xx responses, may update scheduling
-and credentials using `X-Session-Token-Expires-At`, `X-Session-Idle-Expires-At`,
+and credentials using `X-Session-Token-Expires-At`, `X-Session-Token-Refresh-At`, `X-Session-Idle-Expires-At`,
 `X-Session-Absolute-Expires-At`, and optionally `X-CSRF-Token` / `X-Session-Token`.
 A replacement header credential requires all three deadline headers. Late
 responses cannot restore state after logout, destroy, or observed rotation.
+The optional refresh timestamp must be a positive integral Unix second no later
+than token expiry. It stays paired with its credential when older responses
+arrive out of order, including renewals capped to the same absolute expiration.
 Cookie network responses may still apply Set-Cookie outside JavaScript control;
 server-side revocation and storage validation are essential.
 

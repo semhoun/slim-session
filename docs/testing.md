@@ -91,6 +91,13 @@ or modifying the reference applications.
 
 ## Executed Checks
 
+The midpoint-renewal changes passed 298 tests and 2,395 assertions on PHP 8.3.36,
+8.4.27, and 8.5.12 using the same isolated/default backend setup described below.
+PHPStan passed; the browser passed 97 tests, source/consumer typechecks,
+ESM/IIFE builds, and `npm pack --dry-run`. The isolated Slim example passed 63
+smoke checks, including both transports' refresh timestamps and CORS exposure.
+External Redis/PostgreSQL/MySQL/MariaDB and Playwright were not rerun.
+
 The integration-gap changes passed 268 tests and 1,987 assertions on PHP 8.3.36,
 8.4.27, and 8.5.12 with the default file and SQLite backends. PHP 8.3/8.4 ran in
 network-disabled containers with a read-only checkout and private temporary

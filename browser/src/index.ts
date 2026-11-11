@@ -4,6 +4,7 @@ export type SessionStatus = 'uninitialized' | 'authenticated' | 'unauthenticated
 /** Server deadlines are Unix seconds. They are scheduling hints, not authentication proof. */
 export interface SessionMetadata {
   tokenExpiresAt: number;
+  tokenRefreshAt?: number;
   idleExpiresAt: number;
   absoluteExpiresAt: number;
 }
@@ -78,8 +79,8 @@ export class SessionClient {
     if (!this.base.pathname.endsWith('/')) this.base.pathname += '/';
     if (!options.application || !['header', 'cookie'].includes(options.transport)) throw new TypeError('Invalid application or transport');
     if (options.transport === 'cookie' && (options.token || options.storage === 'sessionStorage')) throw new TypeError('Cookie credentials must remain HttpOnly');
-    const ahead = options.refreshAheadSeconds ?? 3600;
-    if (!Number.isFinite(ahead) || ahead < 0) throw new TypeError('Invalid refresh window');
+    const ahead = options.refreshAheadSeconds;
+    if (ahead !== undefined && (!Number.isFinite(ahead) || ahead < 0)) throw new TypeError('Invalid refresh window');
     this.credentialHeader = options.credentialHeader ?? 'Authorization';
     this.responseTokenHeader = options.responseTokenHeader ?? 'X-Session-Token';
     this.csrfHeader = options.csrfHeader ?? 'X-CSRF-Token';
@@ -311,7 +312,12 @@ export class SessionClient {
     for (const field of ['tokenExpiresAt', 'idleExpiresAt', 'absoluteExpiresAt']) {
       if (typeof data[field] !== 'number' || !Number.isSafeInteger(data[field]) || data[field] <= 0) throw new SessionError('Invalid session deadline');
     }
-    return { tokenExpiresAt: data.tokenExpiresAt as number, idleExpiresAt: data.idleExpiresAt as number, absoluteExpiresAt: data.absoluteExpiresAt as number };
+    if (data.tokenRefreshAt !== undefined && (typeof data.tokenRefreshAt !== 'number'
+      || !Number.isSafeInteger(data.tokenRefreshAt) || data.tokenRefreshAt <= 0 || data.tokenRefreshAt > (data.tokenExpiresAt as number))) {
+      throw new SessionError('Invalid session refresh deadline');
+    }
+    return { tokenExpiresAt: data.tokenExpiresAt as number, idleExpiresAt: data.idleExpiresAt as number, absoluteExpiresAt: data.absoluteExpiresAt as number,
+      ...(data.tokenRefreshAt === undefined ? {} : { tokenRefreshAt: data.tokenRefreshAt as number }) };
   }
 
   private async consumeStatus(response: Response, generation: number): Promise<void> {
@@ -340,7 +346,9 @@ export class SessionClient {
       if (this.options.transport === 'header' && response.headers.has(this.responseTokenHeader)) throw new SessionError('Replacement credential lacks expiration metadata');
       return;
     }
-    const metadata = this.metadata({ tokenExpiresAt: Number(values[0]), idleExpiresAt: Number(values[1]), absoluteExpiresAt: Number(values[2]) });
+    const refreshAt = response.headers.get('X-Session-Token-Refresh-At');
+    const metadata = this.metadata({ tokenExpiresAt: Number(values[0]), idleExpiresAt: Number(values[1]), absoluteExpiresAt: Number(values[2]),
+      ...(refreshAt === null ? {} : { tokenRefreshAt: Number(refreshAt) }) });
     const csrf = response.headers.get(this.csrfHeader) ?? this.csrf;
     this.accept(metadata, response, csrf);
   }
@@ -355,9 +363,12 @@ export class SessionClient {
     const current = this.current.metadata;
     if (sameSession && current !== null) {
       // Responses can arrive out of order even though server writes are serialized.
-      if (metadata.tokenExpiresAt < current.tokenExpiresAt) {
+      if (metadata.tokenExpiresAt < current.tokenExpiresAt || (metadata.tokenExpiresAt === current.tokenExpiresAt
+        && current.tokenRefreshAt !== undefined && (metadata.tokenRefreshAt === undefined || metadata.tokenRefreshAt < current.tokenRefreshAt))) {
         replacement = null;
         metadata = { ...metadata, tokenExpiresAt: current.tokenExpiresAt };
+        if (current.tokenRefreshAt === undefined) delete metadata.tokenRefreshAt;
+        else metadata.tokenRefreshAt = current.tokenRefreshAt;
       }
       metadata = { ...metadata, idleExpiresAt: Math.max(metadata.idleExpiresAt, current.idleExpiresAt) };
     }
@@ -422,7 +433,10 @@ export class SessionClient {
     if (expiresIn <= 0) { this.clear('unauthenticated'); return; }
     const auto = this.options.autoRefresh !== false && this.refreshFailures <= 2;
     if (!auto) return;
-    const refreshIn = Math.max(1000, metadata.tokenExpiresAt * 1000 - Date.now() - (this.options.refreshAheadSeconds ?? 3600) * 1000);
+    const refreshAt = this.options.refreshAheadSeconds !== undefined
+      ? metadata.tokenExpiresAt - this.options.refreshAheadSeconds
+      : metadata.tokenRefreshAt ?? metadata.tokenExpiresAt - 3600;
+    const refreshIn = Math.max(1000, refreshAt * 1000 - Date.now());
     const refreshDelay = retryDelay ?? refreshIn;
     const delay = Math.min(expiresIn, refreshDelay, maxTimerDelay);
     this.timer = setTimeout(() => {
